@@ -1,0 +1,103 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slay"
+version = "0.1.0"
+description = "Distributed computing made simple - scale Python functions to thousands of concurrent executions"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Anomaly Co", email = "team@anomalyco.com"}
+]
+keywords = ["distributed", "computing", "serverless", "aws", "lambda", "parallelism"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+]
+
+dependencies = [
+    "dill>=0.3.7",
+    "boto3>=1.28.0",
+    "botocore>=1.31.0",
+    "typing-extensions>=4.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "moto[s3,lambda,iam,dynamodb,sqs]>=4.2.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.5.0",
+    "ruff>=0.1.0",
+]
+cdk = [
+    "aws-cdk-lib>=2.100.0",
+    "constructs>=10.0.0",
+]
+pandas = [
+    "pandas>=1.5.0",
+    "pyarrow>=12.0.0",
+]
+numpy = [
+    "numpy>=1.24.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/anomalyco/slay"
+Documentation = "https://github.com/anomalyco/slay#readme"
+Repository = "https://github.com/anomalyco/slay"
+"Bug Tracker" = "https://github.com/anomalyco/slay/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = [
+    "slay",
+    "slay.backends",
+    "slay.control",
+    "slay.core",
+    "slay.observability",
+    "slay.storage",
+]
+
+[tool.setuptools.package-data]
+slay = ["py.typed"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-v --cov=slay --cov-report=term-missing:skip-covered"
+testpaths = ["tests"]
+pythonpath = ["src", "infrastructure"]
+python_files = ["test_*.py", "*_test.py"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # line too long (black handles this)

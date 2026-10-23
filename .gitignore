@@ -1,0 +1,9 @@
+__pycache__
+.env
+venv/
+*.egg-info/
+.coverage
+.pytest_cache/
+infrastructure/node_modules/
+infrastructure/cdk.out/
+SPEC.md

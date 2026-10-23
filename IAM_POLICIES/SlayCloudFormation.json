@@ -1,0 +1,38 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudFormationStackManagement",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:DeleteStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:DescribeStackResources",
+        "cloudformation:ListStacks",
+        "cloudformation:GetTemplate",
+        "cloudformation:ValidateTemplate",
+        "cloudformation:CreateChangeSet",
+        "cloudformation:DeleteChangeSet",
+        "cloudformation:DescribeChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:GetTemplateSummary"
+      ],
+      "Resource": [
+        "arn:aws:cloudformation:*:026792689263:stack/slay-*",
+        "arn:aws:cloudformation:*:026792689263:stack/Slay*",
+        "arn:aws:cloudformation:*:026792689263:stack/CDKToolkit*"
+      ]
+    },
+    {
+      "Sid": "CloudFormationTypeManagement",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:ListTypeRegistrations"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
