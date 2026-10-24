@@ -10,14 +10,16 @@ If you have AWS credentials and just need the permissions:
 # 1. Get your account ID
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
-# 2. Apply permissions
+# 2. Apply permissions: a managed policy, attached to your user
 policy=$(mktemp)
 sed "s/ACCOUNT_ID/$ACCOUNT_ID/g" IAM_POLICY.json > "$policy"
-aws iam put-user-policy \
-  --user-name your-username \
+aws iam create-policy \
   --policy-name SlayDeployment \
   --policy-document "file://$policy"
 rm -f "$policy"
+aws iam attach-user-policy \
+  --user-name your-username \
+  --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/SlayDeployment"
 
 # 3. Deploy
 cd infrastructure
@@ -67,7 +69,7 @@ aws sts get-caller-identity
 
 ### Step 3: Set Up IAM Permissions
 
-We provide a ready-to-use IAM policy that includes only the permissions needed for Slay.
+We provide a ready-to-use IAM policy that includes only the permissions needed to deploy and use Slay. It is too large for an inline user policy (2,048 characters), so create it as a managed policy.
 
 **Option A: Use the provided policy (Recommended)**
 
@@ -76,25 +78,29 @@ We provide a ready-to-use IAM policy that includes only the permissions needed f
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 echo "Your AWS Account ID: $ACCOUNT_ID"
 
-# Create a policy file with your account ID
+# Create the policy with your account ID
 policy=$(mktemp)
 sed "s/ACCOUNT_ID/$ACCOUNT_ID/g" IAM_POLICY.json > "$policy"
-
-# Attach the policy to your user
-aws iam put-user-policy \
-  --user-name your-username \
+aws iam create-policy \
   --policy-name SlayDeployment \
   --policy-document "file://$policy"
 rm -f "$policy"
+
+# Attach the policy to your user
+aws iam attach-user-policy \
+  --user-name your-username \
+  --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/SlayDeployment"
 ```
 
 **Option B: Via AWS Console**
-1. Go to https://console.aws.amazon.com/iam/users
-2. Click your username
-3. Click "Add inline policy"
-4. Choose "JSON" editor
-5. Copy the contents of `IAM_POLICY.json` (replace `ACCOUNT_ID` with your 12-digit account ID)
-6. Click "Review policy" → "Create policy"
+1. Go to https://console.aws.amazon.com/iam/home#/policies
+2. Click "Create policy"
+3. Choose "JSON" editor
+4. Copy the contents of `IAM_POLICY.json` (replace `ACCOUNT_ID` with your 12-digit account ID)
+5. Name it `SlayDeployment` and click "Create policy"
+6. Open your user, click "Add permissions" → "Attach policies directly", and select `SlayDeployment`
+
+Users who only run slay need `IAM_POLICIES/SlayClient.json` alone; see [IAM_POLICIES/README.md](IAM_POLICIES/README.md).
 
 **Option C: Use AWS Managed Policies** (easier but less secure)
 ```bash

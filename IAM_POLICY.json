@@ -82,6 +82,38 @@
       ]
     },
     {
+      "Sid": "SlayExecutor",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:InvokeFunction"
+      ],
+      "Resource": [
+        "arn:aws:lambda:*:ACCOUNT_ID:function:slay-executor"
+      ]
+    },
+    {
+      "Sid": "SlayStateMachines",
+      "Effect": "Allow",
+      "Action": [
+        "states:StartExecution"
+      ],
+      "Resource": [
+        "arn:aws:states:*:ACCOUNT_ID:stateMachine:slay-retry",
+        "arn:aws:states:*:ACCOUNT_ID:stateMachine:slay-fanout"
+      ]
+    },
+    {
+      "Sid": "SlayExecutions",
+      "Effect": "Allow",
+      "Action": [
+        "states:DescribeExecution"
+      ],
+      "Resource": [
+        "arn:aws:states:*:ACCOUNT_ID:execution:slay-retry:*",
+        "arn:aws:states:*:ACCOUNT_ID:execution:slay-fanout:*"
+      ]
+    },
+    {
       "Sid": "DynamoDBTableManagement",
       "Effect": "Allow",
       "Action": [

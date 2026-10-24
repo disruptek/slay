@@ -2,30 +2,38 @@
 
 ## TL;DR - What You Need
 
-Use the provided policy file: **`IAM_POLICY.json`**
+Use the provided policy file: **`IAM_POLICY.json`**. It is too large for
+an inline user policy (2,048 characters), so create it as a managed
+policy and attach that:
 
 ```bash
 # 1. Get your account ID
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
-# 2. Apply the policy
+# 2. Create the policy
 policy=$(mktemp)
 sed "s/ACCOUNT_ID/$ACCOUNT_ID/g" IAM_POLICY.json > "$policy"
-
-# 3. Attach to your user
-aws iam put-user-policy \
-  --user-name your-username \
+aws iam create-policy \
   --policy-name SlayDeployment \
   --policy-document "file://$policy"
 rm -f "$policy"
+
+# 3. Attach to your user
+aws iam attach-user-policy \
+  --user-name your-username \
+  --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/SlayDeployment"
 ```
+
+Users who only run slay need less: `IAM_POLICIES/SlayClient.json` (see
+[IAM_POLICIES/README.md](IAM_POLICIES/README.md)).
 
 ## What Services Need Permissions
 
 | Service | Why | Min Permissions |
 |---------|-----|-----------------|
 | **S3** | Data storage | Create/delete buckets, read/write objects |
-| **Lambda** | Code execution | Create/delete functions, update code |
+| **Lambda** | Code execution | Create/delete functions, update code, invoke |
+| **Step Functions** | Retries and fan-out | Start and describe executions |
 | **IAM** | Permissions | Create roles, pass roles to Lambda |
 | **DynamoDB** | Metadata | Create/delete tables |
 | **CloudFormation** | Deployment | Create/update/delete stacks |
@@ -64,6 +72,13 @@ rm -f "$policy"
 ✓ lambda:UpdateFunctionCode
 ✓ lambda:UpdateFunctionConfiguration
 ✓ lambda:ListFunctions
+✓ lambda:InvokeFunction
+```
+
+### Step Functions
+```
+✓ states:StartExecution      (slay-retry, slay-fanout)
+✓ states:DescribeExecution   (their executions)
 ```
 
 ### IAM
@@ -135,12 +150,11 @@ If you need quick setup and can't use the custom policy:
 
 ```bash
 # List all your policies
-aws iam list-user-policies --user-name your-username
+aws iam list-attached-user-policies --user-name your-username
 
 # Check specific policy
-aws iam get-user-policy \
-  --user-name your-username \
-  --policy-name SlayDeployment
+aws iam get-policy \
+  --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/SlayDeployment"
 
 # Use policy simulator to test
 # https://policysim.aws.amazon.com/

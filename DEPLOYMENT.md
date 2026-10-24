@@ -120,7 +120,8 @@ aws lambda list-functions --region us-east-1
 
 Create a `.env` file in your project root. `SLAY_STORAGE_BUCKET` is the
 `StorageBucket` output of `SlayStorageStack`; slay does not detect it.
-Keep `.env` out of version control:
+Keep `.env` out of version control. The credentials need the client
+permissions listed under "Permissions" in [README.md](README.md):
 
 ```bash
 SLAY_BACKEND=lambda
@@ -178,17 +179,20 @@ See [AWS_IAM_SETUP.md](AWS_IAM_SETUP.md) for complete instructions on:
 - Using the provided `IAM_POLICY.json` template
 - Troubleshooting specific permission errors
 
-**Quick fix**: Attach the pre-built policy:
+**Quick fix**: Attach the pre-built policy. It is too large for an inline
+user policy, so create it as a managed policy:
 ```bash
-# Replace YOUR_ACCOUNT_ID with your 12-digit AWS account ID
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 policy=$(mktemp)
-sed "s/ACCOUNT_ID/YOUR_ACCOUNT_ID/g" IAM_POLICY.json > "$policy"
+sed "s/ACCOUNT_ID/$ACCOUNT_ID/g" IAM_POLICY.json > "$policy"
 
-aws iam put-user-policy \
-  --user-name your-username \
+aws iam create-policy \
   --policy-name SlayDeployment \
   --policy-document "file://$policy"
 rm -f "$policy"
+aws iam attach-user-policy \
+  --user-name your-username \
+  --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/SlayDeployment"
 ```
 
 Or contact your AWS administrator and share the [AWS_IAM_SETUP.md](AWS_IAM_SETUP.md) guide with them.

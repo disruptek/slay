@@ -44,14 +44,17 @@ Complete this checklist to ensure your AWS account is properly configured for Sl
 
 - [ ] IAM policy applied
   ```bash
-  # Option A: Using the provided policy file
+  # Option A: The provided policy file, as a managed policy (it is too
+  # large for an inline user policy)
   policy=$(mktemp)
   sed "s/ACCOUNT_ID/$ACCOUNT_ID/g" IAM_POLICY.json > "$policy"
-  aws iam put-user-policy \
-    --user-name your-username \
+  aws iam create-policy \
     --policy-name SlayDeployment \
     --policy-document "file://$policy"
   rm -f "$policy"
+  aws iam attach-user-policy \
+    --user-name your-username \
+    --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/SlayDeployment"
   
   # Option B: Using AWS managed policies
   aws iam attach-user-policy \
@@ -211,9 +214,11 @@ Complete this checklist to ensure your AWS account is properly configured for Sl
 
 - [ ] Remove IAM policy
   ```bash
-  aws iam delete-user-policy \
+  aws iam detach-user-policy \
     --user-name your-username \
-    --policy-name SlayDeployment
+    --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/SlayDeployment"
+  aws iam delete-policy \
+    --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/SlayDeployment"
   ```
 
 - [ ] Revoke access keys (if no longer needed)
@@ -231,7 +236,7 @@ Complete this checklist to ensure your AWS account is properly configured for Sl
 - [ ] See [DEPLOYMENT.md](DEPLOYMENT.md#error-unable-to-resolve-aws-account-to-use)
 
 ### Issue: "User is not authorized"
-- [ ] Check permissions: `aws iam get-user-policy --user-name your-username --policy-name SlayDeployment`
+- [ ] Check permissions: `aws iam list-attached-user-policies --user-name your-username`
 - [ ] See [AWS_IAM_SETUP.md](AWS_IAM_SETUP.md)
 
 ### Issue: "S3 bucket already exists"

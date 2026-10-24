@@ -471,17 +471,28 @@ names the `slay` module serializes in the client and in the executor.
 
 A client that uses the Lambda backend needs:
 
-- `lambda:InvokeFunction` on `slay-executor`;
+- `lambda:InvokeFunction` on `slay-executor`, and `lambda:GetFunction`
+  on it for `SLAY_BACKEND=auto`: without it, auto-detection picks the
+  local backend;
 - `s3:GetObject`, `s3:PutObject` and `s3:ListBucket` on the storage
   bucket (see [Caching](#caching) for why `ListBucket`);
 - for `add_retry`: `states:StartExecution` on the `slay-retry` state
-  machine, `states:DescribeExecution` on its executions, and
-  `sts:GetCallerIdentity`, because slay builds the state machine ARN from
-  the account and the region;
+  machine and `states:DescribeExecution` on its executions;
 - for `apply()`, `start_apply()` and `attach()`: the same on the
   `slay-fanout` state machine and its executions.
 
-The policies in `IAM_POLICIES/` cover deployment, not these calls.
+slay builds the state machine ARNs from the account that
+`sts:GetCallerIdentity` returns. That call needs no permission.
+
+`IAM_POLICIES/SlayClient.json` grants these rights, and `IAM_POLICY.json`
+holds them together with the deployment rights. To give them to an IAM
+group (see `IAM_POLICIES/README.md`):
+
+```bash
+cd IAM_POLICIES
+./manage-policies.sh apply -t slayers            # deploy and use slay
+./manage-policies.sh apply -t slay-users --client  # use slay only
+```
 
 ## Deployment
 

@@ -7,6 +7,7 @@ calls the in-process Lambda stand-in. The fixture's ResultWriter writes
 the result files as AWS does. No AWS calls.
 """
 
+import gc
 import json
 import time
 import uuid
@@ -112,13 +113,24 @@ class TestConcurrency:
     ITEMS = [0, 1, 2, 3]
 
     def _elapsed(self, fanout, stand_in, max_concurrency):
+        """
+        Seconds for the fan-out, without garbage collection: the test
+        session's heap holds about a million objects, and one full
+        collection there takes about 0.5 seconds, as long as one item.
+        """
         stand_in.delay = lambda event: self.DELAY
-        started = time.monotonic()
-        outputs = child_outputs(
-            run_fanout(fanout, slay.put(lambda x: x), self.ITEMS, max_concurrency=max_concurrency)
-        )
+        gc.collect()
+        gc.disable()
+        try:
+            started = time.monotonic()
+            outputs = child_outputs(
+                run_fanout(fanout, slay.put(lambda x: x), self.ITEMS, max_concurrency=max_concurrency)
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            gc.enable()
         assert len(outputs) == len(self.ITEMS)
-        return time.monotonic() - started
+        return elapsed
 
     def test_one_at_a_time(self, fanout, stand_in):
         assert self._elapsed(fanout, stand_in, 1) >= self.DELAY * len(self.ITEMS)

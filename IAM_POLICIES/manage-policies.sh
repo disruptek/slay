@@ -31,6 +31,7 @@ POLICIES=(
     "SlayCloudFormation"
     "SlayECRAssets"
     "SlayDynamoDB"
+    "SlayClient"
 )
 REQUIRED_POLICIES=(
     "SlayBootstrap"
@@ -39,6 +40,11 @@ REQUIRED_POLICIES=(
     "SlayIAMRoles"
     "SlayCloudFormation"
     "SlayECRAssets"
+    "SlayClient"
+)
+# The rights to use slay without deploying it; --client selects only these
+CLIENT_POLICIES=(
+    "SlayClient"
 )
 
 # Defaults
@@ -67,6 +73,9 @@ Commands:
 Options:
   -t, --target TARGET_NAME    Group or user name (required for apply/remove/list/verify)
   --type TYPE                 Target type: "group" (default) or "user"
+  -u, --user USER_NAME        Same as -t USER_NAME --type user
+  --client                    Only the policy to use slay (SlayClient), for
+                              apply/remove/verify/status
   -a, --account ACCOUNT_ID    AWS account ID (default: from AWS CLI)
   -d, --dry-run               Show what would be done without doing it
   -v, --verbose               Verbose output
@@ -77,8 +86,11 @@ Examples:
   # Apply all policies to 'slayers' group (recommended)
   $0 apply -t slayers
 
-  # Apply to a specific user
-  $0 apply -t slay --type user
+  # Give one user the client policy (all of them exceed a user's limit)
+  $0 apply -u alice --client
+
+  # Give a group that only uses slay the client policy
+  $0 apply -t slay-users --client
 
   # Apply with dry-run to see what happens
   $0 apply -t slayers --dry-run
@@ -548,6 +560,11 @@ parse_args() {
             --delay)
                 RETRY_DELAY="$2"
                 shift 2
+                ;;
+            --client)
+                POLICIES=("${CLIENT_POLICIES[@]}")
+                REQUIRED_POLICIES=("${CLIENT_POLICIES[@]}")
+                shift
                 ;;
             *)
                 log_error "Unknown option: $1"

@@ -11,6 +11,9 @@ Slay requires permissions to create and manage:
 - **CloudFormation stacks** for infrastructure management
 - **IAM roles** for Lambda execution
 
+and, to use it, permissions to invoke the Lambda function and to run the
+**Step Functions** state machines.
+
 ## Quick Setup
 
 ### Option 1: Using Pre-Built Policy (Recommended)
@@ -23,14 +26,19 @@ We provide a ready-to-use IAM policy file: `IAM_POLICY.json`
    cat IAM_POLICY.json
    ```
 
-2. **Create an inline policy in AWS Console**
+   The policy is too large to be an inline policy of a user: IAM allows
+   a user 2,048 characters of inline policy. Create it as a managed
+   policy, which may hold 6,144, and attach it.
+
+2. **Create a managed policy in AWS Console**
    - Go to https://console.aws.amazon.com/iam/
-   - Click "Users" → Select your user
-   - Click "Add inline policy"
+   - Click "Policies" → "Create policy"
    - Choose "JSON" editor
-   - Copy the contents of `IAM_POLICY.json` (after replacing `ACCOUNT_ID`)
+   - Copy the contents of `IAM_POLICY.json`
    - Replace `ACCOUNT_ID` with your 12-digit AWS account ID
-   - Click "Review policy" → "Create policy"
+   - Name the policy `SlayDeployment` and click "Create policy"
+   - Click "Users" → Select your user → "Add permissions" →
+     "Attach policies directly" → select `SlayDeployment`
 
 3. **Or use AWS CLI**
    ```bash
@@ -41,13 +49,32 @@ We provide a ready-to-use IAM policy file: `IAM_POLICY.json`
    policy=$(mktemp)
    sed "s/ACCOUNT_ID/$ACCOUNT_ID/g" IAM_POLICY.json > "$policy"
    
-   # Create the policy
-   aws iam put-user-policy \
-     --user-name your-username \
+   # Create the policy and attach it to your user
+   aws iam create-policy \
      --policy-name SlayDeployment \
      --policy-document "file://$policy"
+   aws iam attach-user-policy \
+     --user-name your-username \
+     --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/SlayDeployment"
    rm -f "$policy"
    ```
+
+   If the policy exists already, for example from an older
+   `IAM_POLICY.json`, replace its document instead. IAM keeps at most 5
+   versions of a policy; delete an old one first if it has 5.
+   ```bash
+   policy=$(mktemp)
+   sed "s/ACCOUNT_ID/$ACCOUNT_ID/g" IAM_POLICY.json > "$policy"
+   aws iam create-policy-version \
+     --policy-arn "arn:aws:iam::$ACCOUNT_ID:policy/SlayDeployment" \
+     --policy-document "file://$policy" \
+     --set-as-default
+   rm -f "$policy"
+   ```
+
+The modular policies in `IAM_POLICIES/` grant the same kinds of rights,
+in files small enough to be inline policies of a group. See
+[IAM_POLICIES/README.md](IAM_POLICIES/README.md).
 
 ### Option 2: Using AWS Managed Policies (Less Secure)
 
@@ -92,8 +119,20 @@ aws iam attach-user-policy \
 | `lambda:GetFunction` | Read function config |
 | `lambda:UpdateFunctionCode` | Update function code |
 | `lambda:UpdateFunctionConfiguration` | Modify settings |
+| `lambda:InvokeFunction` | Run functions on `slay-executor` |
 
 **Resource Pattern:** `arn:aws:lambda:*:ACCOUNT_ID:function:slay-*`
+
+### Step Functions (Using slay)
+
+| Action | Purpose |
+|--------|---------|
+| `states:StartExecution` | Run `add_retry` calls and `apply()` |
+| `states:DescribeExecution` | Wait for those executions |
+
+**Resource Patterns:**
+- `arn:aws:states:*:ACCOUNT_ID:stateMachine:slay-retry` and `slay-fanout`
+- `arn:aws:states:*:ACCOUNT_ID:execution:slay-retry:*` and `slay-fanout:*`
 
 ### IAM (Permissions)
 
@@ -222,10 +261,15 @@ aws iam attach-user-policy \
 
 4. **Audit Permissions Regularly**
    ```bash
-   # Check what permissions a user has
-   aws iam get-user-policy \
-     --user-name your-username \
-     --policy-name SlayDeployment
+   # Check which policies a user has
+   aws iam list-attached-user-policies --user-name your-username
+
+   # Read the default version of the policy
+   aws iam get-policy-version \
+     --policy-arn "arn:aws:iam::ACCOUNT_ID:policy/SlayDeployment" \
+     --version-id "$(aws iam get-policy \
+       --policy-arn "arn:aws:iam::ACCOUNT_ID:policy/SlayDeployment" \
+       --query Policy.DefaultVersionId --output text)"
    ```
 
 5. **Use Separate Users for Different Environments**
@@ -260,14 +304,19 @@ To remove Slay permissions from a user:
 
 ```bash
 # Using CLI
-aws iam delete-user-policy \
+aws iam detach-user-policy \
   --user-name your-username \
-  --policy-name SlayDeployment
+  --policy-arn "arn:aws:iam::ACCOUNT_ID:policy/SlayDeployment"
+
+# Delete the policy once nothing has it attached and only its default
+# version is left (aws iam delete-policy-version removes the others)
+aws iam delete-policy \
+  --policy-arn "arn:aws:iam::ACCOUNT_ID:policy/SlayDeployment"
 
 # Or in AWS Console:
 # 1. Go to IAM → Users
 # 2. Select user
-# 3. Click "X" next to policy name
+# 3. Select the policy under "Permissions policies" and click "Remove"
 ```
 
 ## Additional Resources

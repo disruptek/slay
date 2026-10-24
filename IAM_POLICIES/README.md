@@ -4,17 +4,18 @@ This directory contains separate, modular IAM policies for deploying and using S
 
 ## 🚀 Quick Start
 
-Use the management script to handle all policies:
+Use the management script to handle all policies. It puts them on an IAM
+group as inline policies; add your users to the group.
 
 ```bash
-# Apply all remaining policies
-./manage-policies.sh apply -u slay
+# Apply all policies to the 'slayers' group
+./manage-policies.sh apply -t slayers
 
 # Verify they're all applied
-./manage-policies.sh verify -u slay
+./manage-policies.sh verify -t slayers
 
 # Check detailed status
-./manage-policies.sh status -u slay
+./manage-policies.sh status -t slayers
 ```
 
 Then deploy:
@@ -34,6 +35,9 @@ The `manage-policies.sh` script handles all policy operations for groups or user
 ```bash
 # Apply all policies to 'slayers' group (RECOMMENDED)
 ./manage-policies.sh apply -t slayers
+
+# Apply only SlayClient, for a group that uses slay but does not deploy it
+./manage-policies.sh apply -t slay-users --client
 
 # Verify all required policies are applied
 ./manage-policies.sh verify -t slayers
@@ -57,6 +61,9 @@ The `manage-policies.sh` script handles all policy operations for groups or user
 **Options:**
 - `-t, --target NAME` - Group or user name (required for most commands)
 - `--type TYPE` - Target type: "group" (default) or "user"
+- `-u, --user NAME` - Same as `-t NAME --type user`
+- `--client` - Work on SlayClient only: `apply`, `remove`, `verify` and
+  `status` then ignore the deployment policies
 - `-d, --dry-run` - Preview changes without applying
 - `-v, --verbose` - Show detailed output
 - `-r, --retries N` - Number of retries (default: 3)
@@ -67,8 +74,8 @@ The `manage-policies.sh` script handles all policy operations for groups or user
 # Apply to slayers group (default)
 ./manage-policies.sh apply -t slayers
 
-# Apply to a specific user instead
-./manage-policies.sh apply -t slay --type user
+# Give one user the client rights only
+./manage-policies.sh apply -u alice --client
 
 # Apply with verbose output
 ./manage-policies.sh apply -t slayers -v
@@ -86,19 +93,23 @@ The `manage-policies.sh` script handles all policy operations for groups or user
 
 ## Policies
 
-| Policy | Size | Limit Status | Purpose |
-|--------|------|--------------|---------|
-| **SlayS3Storage.json** | 1,039 B | ✓ OK | S3 bucket management |
-| **SlayLambdaCompute.json** | 583 B | ✓ OK | Lambda function management |
-| **SlayIAMRoles.json** | 1,119 B | ✓ OK | IAM role management + STS assume |
-| **SlayCloudFormation.json** | 1,141 B | ✓ OK | CloudFormation stack management |
-| **SlayDynamoDB.json** | 472 B | ✓ OK | DynamoDB table management |
-| **SlayECRAssets.json** | 916 B | ✓ OK | ECR repository + CDK asset buckets |
-| **SlayBootstrap.json** | 357 B | ✓ OK | CDK bootstrap SSM parameters |
+| Policy | Characters | Purpose |
+|--------|-----------:|---------|
+| **SlayS3Storage.json** | 707 | S3 bucket management |
+| **SlayLambdaCompute.json** | 415 | Lambda function management |
+| **SlayIAMRoles.json** | 765 | IAM role management + STS assume |
+| **SlayCloudFormation.json** | 861 | CloudFormation stack management |
+| **SlayDynamoDB.json** | 331 | DynamoDB table management |
+| **SlayECRAssets.json** | 620 | ECR repository + CDK asset buckets |
+| **SlayBootstrap.json** | 243 | CDK bootstrap SSM parameters |
+| **SlayClient.json** | 857 | Use slay: invoke the executor, run the state machines, read and write the bucket |
 
-**Total:** 5,627 bytes across 7 policies
-**AWS Limit:** 2,048 bytes per inline policy ✓ (all policies compliant)
-**Note:** Each policy is a separate inline policy to stay within AWS's 2048 byte limit per policy
+**Total:** 4,799 characters across 8 policies.
+
+**Limits:** IAM adds up all the inline policies of one user, group or
+role, and does not count whitespace. A group may hold 5,120 characters
+and a user 2,048. Put all eight policies on a group. A user can hold
+SlayClient alone, which is what `--client` applies.
 
 ## Quick Setup
 
@@ -107,16 +118,14 @@ The `manage-policies.sh` script handles all policy operations for groups or user
 ```bash
 #!/bin/bash
 
-# Your AWS account ID
-ACCOUNT_ID="026792689263"
-USERNAME="slay"
+GROUP="slayers"
 
 # Apply each policy
 for policy in Slay*.json; do
     policy_name="${policy%.json}"
     echo "Applying $policy_name..."
-    aws iam put-user-policy \
-        --user-name "$USERNAME" \
+    aws iam put-group-policy \
+        --group-name "$GROUP" \
         --policy-name "$policy_name" \
         --policy-document "file://$(pwd)/$policy"
 done
@@ -126,9 +135,9 @@ echo "✓ All policies applied!"
 
 ### Option 2: Apply Policies via AWS Console
 
-1. Go to https://console.aws.amazon.com/iam/users/slay
+1. Go to https://console.aws.amazon.com/iam/home#/groups and open the `slayers` group
 2. For each policy file:
-   - Click "Add inline policy"
+   - Click "Add permissions" → "Create inline policy"
    - Choose "JSON" tab
    - Copy the contents of the policy file
    - Set the policy name (e.g., "SlayS3Storage")
@@ -139,97 +148,60 @@ echo "✓ All policies applied!"
 If you only need specific functionality:
 
 ```bash
-aws iam put-user-policy \
-    --user-name slay \
-    --policy-name SlayS3Storage \
-    --policy-document file://SlayS3Storage.json
+aws iam put-group-policy \
+    --group-name slayers \
+    --policy-name SlayClient \
+    --policy-document file://SlayClient.json
 ```
 
 ## What Each Policy Does
 
+Apply any one of them with the command of Option 3, with its name.
+
 ### SlayS3Storage.json
 **Permissions:** S3 bucket and object management
 **Used for:** Creating/managing Slay data storage bucket
-**Minimum required:** Yes
-
-```bash
-aws iam put-user-policy \
-    --user-name slay \
-    --policy-name SlayS3Storage \
-    --policy-document file://SlayS3Storage.json
-```
+**Minimum required:** Yes, to deploy
 
 ### SlayLambdaCompute.json
 **Permissions:** Lambda function lifecycle management
 **Used for:** Creating and configuring Lambda executor function
-**Minimum required:** Yes
-
-```bash
-aws iam put-user-policy \
-    --user-name slay \
-    --policy-name SlayLambdaCompute \
-    --policy-document file://SlayLambdaCompute.json
-```
+**Minimum required:** Yes, to deploy
 
 ### SlayIAMRoles.json
 **Permissions:** IAM role creation, policy attachment, STS assume role
 **Used for:** Creating execution roles for Lambda and CDK
-**Minimum required:** Yes
-
-```bash
-aws iam put-user-policy \
-    --user-name slay \
-    --policy-name SlayIAMRoles \
-    --policy-document file://SlayIAMRoles.json
-```
+**Minimum required:** Yes, to deploy
 
 ### SlayCloudFormation.json
 **Permissions:** CloudFormation stack and changeset management
 **Used for:** Deploying CDK infrastructure
-**Minimum required:** Yes
-
-```bash
-aws iam put-user-policy \
-    --user-name slay \
-    --policy-name SlayCloudFormation \
-    --policy-document file://SlayCloudFormation.json
-```
+**Minimum required:** Yes, to deploy
 
 ### SlayDynamoDB.json
 **Permissions:** DynamoDB table management
 **Used for:** Creating metadata tables (optional)
 **Minimum required:** No (only if using DynamoDB)
 
-```bash
-aws iam put-user-policy \
-    --user-name slay \
-    --policy-name SlayDynamoDB \
-    --policy-document file://SlayDynamoDB.json
-```
-
 ### SlayECRAssets.json
 **Permissions:** ECR repository + CDK asset bucket management
 **Used for:** Storing container images and deployment artifacts
-**Minimum required:** Yes (for CDK asset uploads)
-
-```bash
-aws iam put-user-policy \
-    --user-name slay \
-    --policy-name SlayECRAssets \
-    --policy-document file://SlayECRAssets.json
-```
+**Minimum required:** Yes, to deploy (for CDK asset uploads)
 
 ### SlayBootstrap.json
 **Permissions:** SSM parameter access for CDK bootstrap
 **Used for:** Reading/writing CDK bootstrap configuration
-**Minimum required:** Yes
+**Minimum required:** Yes, to deploy
 
-```bash
-aws iam put-user-policy \
-    --user-name slay \
-    --policy-name SlayBootstrap \
-    --policy-document file://SlayBootstrap.json
-```
+### SlayClient.json
+**Permissions:** `lambda:GetFunction` and `lambda:InvokeFunction` on
+`slay-executor`; `states:StartExecution` on `slay-retry` and
+`slay-fanout`, and `states:DescribeExecution` on their executions;
+`s3:GetObject`, `s3:PutObject` and `s3:ListBucket` on the storage bucket
+**Used for:** Running functions on Lambda: `run()`, `add_retry`,
+`apply()`, jobs and the result cache (see "Permissions" in
+[../README.md](../README.md))
+**Minimum required:** Yes, to use slay
 
 ## Minimum Setup (Bare Essentials)
 
@@ -242,10 +214,12 @@ To deploy Slay, you need at minimum:
 5. **SlayECRAssets.json** - Assets
 6. **SlayBootstrap.json** - Bootstrap
 
+To use it, you need **SlayClient.json**.
+
 ```bash
-for policy in SlayS3Storage SlayLambdaCompute SlayIAMRoles SlayCloudFormation SlayECRAssets SlayBootstrap; do
-    aws iam put-user-policy \
-        --user-name slay \
+for policy in SlayS3Storage SlayLambdaCompute SlayIAMRoles SlayCloudFormation SlayECRAssets SlayBootstrap SlayClient; do
+    aws iam put-group-policy \
+        --group-name slayers \
         --policy-name "$policy" \
         --policy-document "file://${policy}.json"
 done
@@ -260,11 +234,11 @@ Add if needed:
 ## Verification
 
 ```bash
-# List all policies for the user
-aws iam list-user-policies --user-name slay
+# List all policies for the group
+aws iam list-group-policies --group-name slayers
 
 # View a specific policy
-aws iam get-user-policy --user-name slay --policy-name SlayS3Storage
+aws iam get-group-policy --group-name slayers --policy-name SlayS3Storage
 
 # Verify permissions with policy simulator
 # https://policysim.aws.amazon.com/
@@ -274,11 +248,12 @@ aws iam get-user-policy --user-name slay --policy-name SlayS3Storage
 
 ### Policy size exceeded
 
-If you get "LimitExceeded: Inline policy size limit exceeded", you have:
-- Too many inline policies
-- Individual policy too large
+If you get "LimitExceeded: Maximum policy size ... exceeded", the inline
+policies of that user or group add up to more than its limit (see
+[Policies](#policies)).
 
-**Solution:** Combine related policies or use managed policies
+**Solution:** Apply the policies to a group, or give a user SlayClient
+only (`--client`).
 
 ### Missing permissions
 
@@ -311,7 +286,7 @@ done
 ## Best Practices
 
 1. **Apply only needed policies** - Don't apply SlayDynamoDB if you're not using DynamoDB
-2. **Use separate profiles** - Create separate IAM users for dev vs production
+2. **Use separate groups** - Users who only run slay need SlayClient, not the deployment policies
 3. **Rotate credentials** - Periodically create new access keys and revoke old ones
 4. **Monitor usage** - Check CloudTrail for unauthorized access attempts
 5. **Principle of least privilege** - Only grant permissions that are necessary
@@ -321,9 +296,9 @@ done
 To remove all Slay policies:
 
 ```bash
-for policy in SlayS3Storage SlayLambdaCompute SlayIAMRoles SlayCloudFormation SlayDynamoDB SlayECRAssets SlayBootstrap; do
-    aws iam delete-user-policy \
-        --user-name slay \
+for policy in SlayS3Storage SlayLambdaCompute SlayIAMRoles SlayCloudFormation SlayDynamoDB SlayECRAssets SlayBootstrap SlayClient; do
+    aws iam delete-group-policy \
+        --group-name slayers \
         --policy-name "$policy"
 done
 ```
