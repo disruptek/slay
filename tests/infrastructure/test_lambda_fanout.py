@@ -9,6 +9,7 @@ import json
 import boto3
 import pytest
 import slay
+from functions import fail_odd
 from lambda_stand_in import function_error
 from run_log import logged, runs
 from sfn_stand_in import EndedExecution
@@ -60,12 +61,6 @@ def read_json(key):
 def item(ref):
     """An entry of the items file: one call with one positional argument"""
     return {"args_refs": [ref_to_dict(ref)], "kwargs_refs": {}}
-
-
-def fail_odd(x):
-    if x % 2:
-        raise ValueError(str(x))
-    return x
 
 
 class TestApply:

@@ -10,6 +10,11 @@ from aws_cdk import (
 )
 from constructs import Construct
 
+# The prefixes whose objects expire: values, cache entries and fan-out
+# files. A schedule's copies live under schedules/, which must outlive
+# them, so no rule may cover the whole bucket.
+EXPIRING_PREFIXES = ("refs/", "cache/", "fanout/")
+
 
 class StorageStack(Stack):
     """Storage infrastructure for slay (S3 + DynamoDB)"""
@@ -26,6 +31,7 @@ class StorageStack(Stack):
             versioned=False,  # Content-addressed = no versioning needed
             lifecycle_rules=[
                 s3.LifecycleRule(
+                    prefix=prefix,
                     # Transition to cheaper storage after 30 days
                     transitions=[
                         s3.Transition(
@@ -36,6 +42,7 @@ class StorageStack(Stack):
                     # Delete after 90 days (adjust based on needs)
                     expiration=Duration.days(90),
                 )
+                for prefix in EXPIRING_PREFIXES
             ],
             # Prevent accidental deletion of data
             removal_policy=RemovalPolicy.RETAIN,

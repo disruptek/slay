@@ -11,6 +11,7 @@ Tests for new API v2.0:
 
 import pytest
 import slay
+from functions import fail_odd
 
 
 class TestPutAndGet:
@@ -494,12 +495,6 @@ class TestLocalErrors:
 
     def test_apply_raises_lowest_failing_index(self, local_backend):
         """apply() raises the error of the first failing item, unchanged"""
-
-        def fail_odd(x):
-            if x % 2:
-                raise ValueError(str(x))
-            return x
-
         with pytest.raises(ValueError) as excinfo:
             slay.apply(slay.put(fail_odd), [0, 1, 2, 3])
 

@@ -18,7 +18,14 @@ from aws_cdk import assertions  # noqa: E402
 from lambda_stand_in import InProcessLambda  # noqa: E402
 from stacks.compute import ComputeStack  # noqa: E402
 from stacks.storage import StorageStack  # noqa: E402
-from synth import ACCOUNT, BUCKET, REGION, state_machine_definition  # noqa: E402
+from synth import (  # noqa: E402
+    ACCOUNT,
+    BUCKET,
+    DEAD_LETTER_QUEUE,
+    REGION,
+    SCHEDULE_GROUP,
+    state_machine_definition,
+)
 
 
 @pytest.fixture(scope="session")
@@ -127,7 +134,8 @@ def sfn(monkeypatch, retry_definition, stand_in):
     """
     A moto Step Functions client whose slay-retry state machine runs the
     synthesized definition. Its lambda:invoke tasks call stand_in. The
-    stack's bucket exists in moto, and SLAY_STORAGE_BUCKET names it.
+    stack's bucket and dead-letter queue exist in moto, and
+    SLAY_STORAGE_BUCKET names the bucket.
     """
     moto = pytest.importorskip("moto")
     pytest.importorskip("antlr4")
@@ -162,6 +170,7 @@ def sfn(monkeypatch, retry_definition, stand_in):
 
     with moto.mock_aws(config={"stepfunctions": {"execute_state_machine": True}}):
         boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
+        boto3.client("sqs", region_name=REGION).create_queue(QueueName=DEAD_LETTER_QUEUE)
         monkeypatch.setenv("SLAY_STORAGE_BUCKET", BUCKET)
         client = boto3.client("stepfunctions", region_name=REGION)
         client.create_state_machine(
@@ -170,6 +179,47 @@ def sfn(monkeypatch, retry_definition, stand_in):
             roleArn=f"arn:aws:iam::{ACCOUNT}:role/slay-retry",
         )
         yield client
+
+
+@pytest.fixture
+def utc(time_zone):
+    """
+    UTC as the local time zone. moto's Wait compares a TimestampPath, in
+    UTC, with the local time, as if the local time were UTC.
+    """
+    time_zone("UTC0")
+
+
+@pytest.fixture
+def dead_letters(sfn):
+    """A function that takes the dead letters sent so far, as JSON bodies"""
+    import boto3
+
+    sqs = boto3.client("sqs", region_name=REGION)
+    url = sqs.get_queue_url(QueueName=DEAD_LETTER_QUEUE)["QueueUrl"]
+
+    def take():
+        bodies = []
+        while True:
+            messages = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10).get(
+                "Messages", []
+            )
+            if not messages:
+                return bodies
+            for message in messages:
+                bodies.append(json.loads(message["Body"]))
+                sqs.delete_message(QueueUrl=url, ReceiptHandle=message["ReceiptHandle"])
+
+    return take
+
+
+@pytest.fixture
+def schedule_group(sfn):
+    """The stack's EventBridge Scheduler group, in moto"""
+    import boto3
+
+    boto3.client("scheduler", region_name=REGION).create_schedule_group(Name=SCHEDULE_GROUP)
+    return SCHEDULE_GROUP
 
 
 @pytest.fixture

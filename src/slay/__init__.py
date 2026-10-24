@@ -9,6 +9,9 @@ Core operations:
     - run(fn, *args): Execute function (core operation)
     - apply(fn, items): Parallel execution over items
     - start_apply(fn, items) / attach(job_id): The same as a Job
+    - run_later(fn, *args) / run_at(when, fn, *args): One call as a Job
+    - schedule(name, expression, fn, *args): The call on a schedule;
+      reschedule, unschedule and schedules manage them
     - Callable syntax: fn(arg) is sugar for run(fn, arg)
 
 Usage:
@@ -40,6 +43,7 @@ Usage:
 from slay.core.reference import create_reference, Reference
 from slay.core.context import set_backend, get_backend
 from slay.api import put, get, get_many, run, apply, start_apply, attach
+from slay.deferred import run_later, run_at, schedule, reschedule, unschedule, schedules
 from slay.jobs import Job
 from slay.wrappers import add_retry, add_caching, add_cache_only
 from slay.exceptions import CacheMiss, RemoteExecutionError, SlayError
@@ -56,6 +60,13 @@ __all__ = [
     "start_apply",
     "attach",
     "Job",
+    # Deferred and scheduled calls
+    "run_later",
+    "run_at",
+    "schedule",
+    "reschedule",
+    "unschedule",
+    "schedules",
     # References
     "create_reference",
     "Reference",

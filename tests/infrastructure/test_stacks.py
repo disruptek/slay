@@ -20,13 +20,21 @@ from stacks.compute import lambda_runtime_for  # noqa: E402
 from synth import (  # noqa: E402
     ACCOUNT,
     BUCKET,
+    DEAD_LETTER_ARN,
+    DEAD_LETTER_QUEUE,
+    DEAD_LETTER_URL,
     EXECUTOR_ARN,
     REGION,
+    SCHEDULE_GROUP,
+    machine_arn,
     role_grants,
     state_machine,
 )
 
 PYTHON = "{}.{}".format(*sys.version_info[:2])
+
+# The states that slay-retry has and the fan-out's loop has not
+DEFERRED_STATES = {"Delayed?", "Wait until", "Dead letter?", "Send raised", "Send lambda error"}
 
 
 class TestLambdaRuntime:
@@ -73,6 +81,14 @@ class TestOutputs:
         _, compute = templates
         compute.has_output("FanoutStateMachine", {})
 
+    def test_dead_letter_queue_output(self, templates):
+        _, compute = templates
+        compute.has_output("DeadLetterQueue", {})
+
+    def test_schedule_group_output(self, templates):
+        _, compute = templates
+        compute.has_output("ScheduleGroup", {})
+
 
 class TestRetryStateMachine:
     """slay-retry: a Standard state machine that may invoke the executor"""
@@ -105,7 +121,11 @@ class TestRetryStateMachine:
     def test_attempt_timeout_and_throttling(self, retry_definition):
         """The Task reads its timeout from the input and retries throttling"""
         states = json.loads(retry_definition)["States"]
-        tasks = [state for state in states.values() if state["Type"] == "Task"]
+        tasks = [
+            state
+            for state in states.values()
+            if state["Type"] == "Task" and state["Resource"].endswith(":lambda:invoke")
+        ]
 
         assert len(tasks) == 1
         (task,) = tasks
@@ -113,6 +133,176 @@ class TestRetryStateMachine:
         retried = {name for rule in task["Retry"] for name in rule["ErrorEquals"]}
         assert "Lambda.TooManyRequestsException" in retried
         assert [catch["ErrorEquals"] for catch in task["Catch"]] == [["States.ALL"]]
+
+
+@pytest.fixture(scope="module")
+def retry_states(retry_definition):
+    return json.loads(retry_definition)["States"]
+
+
+class TestDelay:
+    """slay-retry waits for $.at, when the input has it, before the first attempt"""
+
+    def test_starts_with_the_choice(self, retry_definition):
+        assert json.loads(retry_definition)["StartAt"] == "Delayed?"
+
+    def test_choice_on_at(self, retry_states):
+        assert retry_states["Delayed?"] == {
+            "Type": "Choice",
+            "Choices": [{"Variable": "$.at", "IsPresent": True, "Next": "Wait until"}],
+            "Default": "Attempt",
+        }
+
+    def test_wait_until_the_timestamp(self, retry_states):
+        assert retry_states["Wait until"] == {
+            "Type": "Wait",
+            "TimestampPath": "$.at",
+            "Next": "Attempt",
+        }
+
+
+class TestDeadLetterStates:
+    """slay-retry sends a dead letter after a last attempt that failed"""
+
+    def test_the_last_attempt_goes_to_the_choice(self, retry_states):
+        assert retry_states["Retry?"]["Default"] == "Dead letter?"
+
+    def test_choice_leads_to_a_send_or_to_give_up(self, retry_states):
+        choice = retry_states["Dead letter?"]
+
+        assert choice["Type"] == "Choice"
+        assert choice["Default"] == "Give up"
+        assert {rule["Next"] for rule in choice["Choices"]} == {"Send raised", "Send lambda error"}
+
+    @pytest.mark.parametrize(
+        "name, response, after",
+        [
+            ("Send raised", {"response.$": "$.result.Payload"}, "Raised"),
+            (
+                "Send lambda error",
+                {
+                    "response": {
+                        "status": "lambda_error",
+                        "errorType.$": "$.caught.Error",
+                        "errorMessage.$": "$.caught.Cause",
+                    }
+                },
+                "Lambda error",
+            ),
+        ],
+    )
+    def test_message(self, retry_states, name, response, after):
+        """The body holds the execution, the call and the output's response"""
+        send = retry_states[name]
+
+        assert send["Type"] == "Task"
+        assert send["Resource"] == "arn:aws:states:::sqs:sendMessage"
+        assert send["Parameters"] == {
+            "QueueUrl": DEAD_LETTER_URL,
+            "MessageBody": {"execution.$": "$$.Execution.Id", "call.$": "$.call", **response},
+        }
+        assert send["ResultPath"] is None
+        assert send["Next"] == after
+
+    def test_success_does_not_pass_the_choice(self, retry_states):
+        """A result costs no extra state transition"""
+        assert retry_states["Raised?"]["Default"] == "Returned"
+        assert retry_states["Returned"].get("End") is True
+
+    def test_role_may_send_to_the_queue(self, templates):
+        _, compute = templates
+        grants = role_grants(compute, _role_of(state_machine(compute, "slay-retry")))
+
+        assert ("sqs:SendMessage", DEAD_LETTER_ARN) in grants
+
+    def test_fanout_role_may_not(self, templates):
+        _, compute = templates
+        grants = role_grants(compute, _role_of(state_machine(compute, "slay-fanout")))
+
+        assert not [grant for grant in grants if grant[0].startswith("sqs:")]
+
+
+class TestDeadLetterQueue:
+    def test_queue_keeps_messages_for_14_days(self, templates):
+        _, compute = templates
+        compute.has_resource_properties(
+            "AWS::SQS::Queue",
+            {
+                "QueueName": DEAD_LETTER_QUEUE,
+                "MessageRetentionPeriod": 14 * 24 * 3600,
+                "SqsManagedSseEnabled": True,
+            },
+        )
+
+
+class TestSchedules:
+    """The schedule group, and the role through which Scheduler starts slay-retry"""
+
+    def test_schedule_group(self, templates):
+        _, compute = templates
+        compute.has_resource_properties("AWS::Scheduler::ScheduleGroup", {"Name": SCHEDULE_GROUP})
+
+    @pytest.fixture(scope="class")
+    def scheduler_role(self, templates):
+        _, compute = templates
+        roles = compute.find_resources(
+            "AWS::IAM::Role", {"Properties": {"RoleName": "slay-scheduler"}}
+        )
+        assert len(roles) == 1, roles
+        return roles.popitem()
+
+    def test_role_trusts_scheduler_of_this_account(self, scheduler_role):
+        _, role = scheduler_role
+        (statement,) = role["Properties"]["AssumeRolePolicyDocument"]["Statement"]
+
+        assert statement["Effect"] == "Allow"
+        assert statement["Action"] == "sts:AssumeRole"
+        assert statement["Principal"] == {"Service": "scheduler.amazonaws.com"}
+        assert statement["Condition"] == {"StringEquals": {"aws:SourceAccount": ACCOUNT}}
+
+    def test_role_may_start_slay_retry_only(self, templates, scheduler_role):
+        _, compute = templates
+        role_id, _ = scheduler_role
+        (machine_id,) = compute.find_resources(
+            "AWS::StepFunctions::StateMachine",
+            {"Properties": {"StateMachineName": "slay-retry"}},
+        )
+
+        assert role_grants(compute, role_id) in (
+            {("states:StartExecution", machine_arn("slay-retry"))},
+            {("states:StartExecution", json.dumps({"Ref": machine_id}))},
+        )
+
+
+class TestStorageLifecycle:
+    """Values, cache entries and fan-out files expire; the copies of a schedule do not"""
+
+    @pytest.fixture(scope="class")
+    def rules(self, templates):
+        storage, _ = templates
+        buckets = storage.find_resources(
+            "AWS::S3::Bucket", {"Properties": {"BucketName": assertions.Match.any_value()}}
+        )
+        (bucket,) = buckets.values()
+        return bucket["Properties"]["LifecycleConfiguration"]["Rules"]
+
+    @staticmethod
+    def _prefix(rule):
+        return rule.get("Prefix", rule.get("Filter", {}).get("Prefix"))
+
+    def test_rules_by_prefix(self, rules):
+        assert sorted(self._prefix(rule) for rule in rules) == ["cache/", "fanout/", "refs/"]
+
+    def test_each_rule_tiers_then_expires(self, rules):
+        for rule in rules:
+            assert rule["Status"] == "Enabled"
+            assert rule["ExpirationInDays"] == 90
+            assert rule["Transitions"] == [
+                {"StorageClass": "INTELLIGENT_TIERING", "TransitionInDays": 30}
+            ]
+
+    def test_no_rule_covers_the_schedules(self, rules):
+        assert not [rule for rule in rules if "schedules/".startswith(self._prefix(rule) or "")]
 
 
 def _role_of(resource):
@@ -169,13 +359,19 @@ class TestFanoutStateMachine:
             "attempt": 0,
         }
 
-    def test_each_child_runs_the_retry_loop(self, fanout_map, retry_definition):
-        """The item processor holds the same states as slay-retry"""
-        loop = json.loads(retry_definition)
+    def test_each_child_runs_the_retry_loop(self, fanout_map, retry_states):
+        """
+        The item processor holds slay-retry's states, without the wait in
+        front and the dead letters. Its last attempt gives up at once.
+        """
         processor = fanout_map["ItemProcessor"]
+        states = processor["States"]
 
-        assert processor["StartAt"] == loop["StartAt"]
-        assert processor["States"] == loop["States"]
+        assert processor["StartAt"] == "Attempt"
+        assert set(states) == set(retry_states) - DEFERRED_STATES
+        assert states["Retry?"] == {**retry_states["Retry?"], "Default": "Give up"}
+        for name in set(states) - {"Retry?"}:
+            assert states[name] == retry_states[name], name
 
     def test_results_go_to_the_bucket(self, fanout_map):
         writer = fanout_map["ResultWriter"]
@@ -226,6 +422,18 @@ class TestNestedCalls:
                 },
             },
         )
+
+    def test_executor_may_not_schedule(self, templates):
+        """The executor's role has no Scheduler rights, and may pass no role"""
+        _, compute = templates
+        functions = compute.find_resources(
+            "AWS::Lambda::Function", {"Properties": {"FunctionName": "slay-executor"}}
+        )
+        (function,) = functions.values()
+        actions = {action for action, _ in role_grants(compute, _role_of(function))}
+
+        assert not [action for action in actions if action.startswith("scheduler:")]
+        assert "iam:PassRole" not in actions
 
     def test_executor_may_invoke_itself_and_start_executions(self, templates):
         _, compute = templates

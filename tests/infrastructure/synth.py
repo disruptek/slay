@@ -13,6 +13,14 @@ EXECUTOR_ARN = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:slay-executor"
 # The storage stack's bucket name, which crosses to the compute stack as
 # an Fn::ImportValue
 BUCKET = f"slay-storage-{ACCOUNT}-{REGION}"
+DEAD_LETTER_QUEUE = "slay-dead-letter"
+DEAD_LETTER_URL = f"https://sqs.{REGION}.amazonaws.com/{ACCOUNT}/{DEAD_LETTER_QUEUE}"
+DEAD_LETTER_ARN = f"arn:aws:sqs:{REGION}:{ACCOUNT}:{DEAD_LETTER_QUEUE}"
+# The construct id of the queue in the compute stack, and so the start of
+# its logical id
+DEAD_LETTER_ID = "DeadLetters"
+SCHEDULE_GROUP = "slay"
+SCHEDULER_ROLE_ARN = f"arn:aws:iam::{ACCOUNT}:role/slay-scheduler"
 PSEUDO_PARAMETERS = {
     "AWS::Partition": "aws",
     "AWS::Region": REGION,
@@ -26,12 +34,18 @@ def machine_arn(name):
     return f"arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:{name}"
 
 
+def _is_dead_letter_queue(logical_id):
+    return logical_id.startswith(DEAD_LETTER_ID)
+
+
 def resolve(value):
     """
     A template value as plain text: Fn::Join joined, pseudo parameters
-    filled in, every Fn::GetAtt taken as the executor's ARN (the only
-    resource a slay definition names), and every Fn::ImportValue taken as
-    the bucket's name, or its ARN for an export of an Arn attribute.
+    filled in, and every Fn::ImportValue taken as the bucket's name, or
+    its ARN for an export of an Arn attribute. A slay definition names two
+    resources of its stack: the dead-letter queue, whose Ref is its URL
+    and whose Fn::GetAtt is its ARN, and the executor, which every other
+    Fn::GetAtt is taken to be.
     """
     if isinstance(value, str):
         return value
@@ -39,12 +53,16 @@ def resolve(value):
         separator, parts = value["Fn::Join"]
         return separator.join(resolve(part) for part in parts)
     if "Fn::GetAtt" in value:
+        if _is_dead_letter_queue(value["Fn::GetAtt"][0]):
+            return DEAD_LETTER_ARN
         return EXECUTOR_ARN
     if "Fn::ImportValue" in value:
         if "Arn" in value["Fn::ImportValue"]:
             return f"arn:aws:s3:::{BUCKET}"
         return BUCKET
     if "Ref" in value:
+        if _is_dead_letter_queue(value["Ref"]):
+            return DEAD_LETTER_URL
         return PSEUDO_PARAMETERS[value["Ref"]]
     raise ValueError(f"cannot resolve {value!r}")
 

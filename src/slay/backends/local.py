@@ -9,17 +9,35 @@ Executes functions in the current process (useful for:
 
 import time
 import uuid
-from typing import TYPE_CHECKING, Optional, Union
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 from slay.backends.base import ExecutorBackend
 from slay.core.reference import Reference, create_reference
+from slay.exceptions import SlayError
 from slay.wrappers import call, call_many, is_wrapper
 
 if TYPE_CHECKING:
     from slay.wrappers import Retried
 
-# The jobs of this process by ID: their results, or the error that ended them
-_jobs: dict[str, Union[list[Reference], Exception]] = {}
+
+@dataclass(frozen=True)
+class _Job:
+    """
+    A job of this process.
+
+    Attributes:
+        many: True for a job of start_many, False for one of start_one
+        outcome: The results, the result, or the error that ended the job
+    """
+
+    many: bool
+    outcome: Union[list[Reference], Reference, Exception]
+
+
+# The jobs of this process by ID
+_jobs: dict[str, _Job] = {}
 
 
 class LocalBackend(ExecutorBackend):
@@ -131,12 +149,26 @@ class LocalBackend(ExecutorBackend):
         Run execute_many now and keep its results, or its error, in the
         memory of this process under a new job ID.
         """
-        job_id = uuid.uuid4().hex
-        try:
-            _jobs[job_id] = self.execute_many(func_ref, args_list, retry, max_concurrent)
-        except Exception as error:
-            _jobs[job_id] = error
-        return job_id
+        return _record(True, lambda: self.execute_many(func_ref, args_list, retry, max_concurrent))
+
+    def start_one(
+        self,
+        func_ref: Reference,
+        args: list[Reference],
+        kwargs: dict[str, Reference],
+        retry: Optional["Retried"] = None,
+        at: Optional[datetime] = None,
+    ) -> str:
+        """
+        Sleep until at, if it is in the future, then run execute and keep
+        its result, or its error, in the memory of this process under a
+        new job ID.
+        """
+        if at is not None:
+            delay = (at - datetime.now(timezone.utc)).total_seconds()
+            if delay > 0:
+                time.sleep(delay)
+        return _record(False, lambda: self.execute(func_ref, args, kwargs, retry))
 
     def job_status(self, job_id: str) -> str:
         """
@@ -153,17 +185,79 @@ class LocalBackend(ExecutorBackend):
         The job's results, or its error raised again.
 
         Raises:
-            ValueError: If this process has no job with this ID
+            ValueError: If this process has no job of many calls with this ID
         """
-        outcome = _job(job_id)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return list(outcome)
+        return list(_outcome(job_id, many=True))
+
+    def job_result(self, job_id: str) -> Reference:
+        """
+        The job's result, or its error raised again.
+
+        Raises:
+            ValueError: If this process has no job of one call with this ID
+        """
+        return _outcome(job_id, many=False)
+
+    def schedule(
+        self,
+        name: str,
+        expression: str,
+        func_ref: Reference,
+        args: list[Reference],
+        kwargs: dict[str, Reference],
+        retry: Optional["Retried"] = None,
+        replace: bool = False,
+    ) -> None:
+        """Raises SlayError: no process outlives a schedule"""
+        raise _no_schedules()
+
+    def unschedule(self, name: str) -> None:
+        """Raises SlayError: no process outlives a schedule"""
+        raise _no_schedules()
+
+    def schedule_names(self) -> list[str]:
+        """Raises SlayError: no process outlives a schedule"""
+        raise _no_schedules()
 
 
-def _job(job_id: str) -> Union[list[Reference], Exception]:
-    """The outcome of a job of this process"""
+def _record(many: bool, run: Callable[[], Union[list[Reference], Reference]]) -> str:
+    """Run a job now and keep its outcome, or its error, under a new ID"""
+    job_id = uuid.uuid4().hex
+    try:
+        outcome = run()
+    except Exception as error:
+        outcome = error
+    _jobs[job_id] = _Job(many=many, outcome=outcome)
+    return job_id
+
+
+def _job(job_id: str) -> _Job:
+    """A job of this process"""
     try:
         return _jobs[job_id]
     except KeyError:
         raise ValueError(f"No job {job_id} in this process") from None
+
+
+def _outcome(job_id: str, many: bool) -> Union[list[Reference], Reference]:
+    """
+    The outcome of a job of this kind, or its error raised again.
+
+    Raises:
+        ValueError: If this process has no job with this ID, or the job is
+            of the other kind
+    """
+    job = _job(job_id)
+    if job.many != many:
+        held, wanted = ("many calls", "results()") if job.many else ("one call", "result()")
+        raise ValueError(f"Job {job_id} holds {held}; use {wanted}")
+    if isinstance(job.outcome, Exception):
+        raise job.outcome
+    return job.outcome
+
+
+def _no_schedules() -> SlayError:
+    return SlayError(
+        "The local backend cannot keep schedules: no process outlives them. "
+        "Use the Lambda backend."
+    )

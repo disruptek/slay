@@ -1,12 +1,14 @@
 """
-The retry loop of the slay-retry state machine, as a CDK helper.
+The retry loop of the slay-retry state machine, as CDK helpers.
 
 The execution input controls the loop (see DESIGN.md, section 10):
 
     {"index": <the item's index in a fan-out; 0 in slay-retry>,
      "call": <encoded call>,
-     "retry": {"waits": [seconds, ...], "retry_on": [classes], "timeout": seconds},
-     "attempt": 0}
+     "retry": {"waits": [seconds, ...], "retry_on": [classes], "timeout": seconds,
+               "dead_letter": <optional, slay-retry only: true to report a failure>},
+     "attempt": 0,
+     "at": <optional, slay-retry only: UTC time of the first attempt>}
 
 The loop always ends in success. Its output is {"index": ..., "response":
 ...}: the handler's response, or {"status": "lambda_error", "errorType":
@@ -14,10 +16,16 @@ The loop always ends in success. Its output is {"index": ..., "response":
 state cannot re-emit an error name such as States.Timeout, and a Map item
 processor must report every item. The index orders a fan-out's results,
 which the Map's ResultWriter writes in no particular order.
+
+retry_loop builds the loop; deferrable_loop puts a wait for "at" in front
+of it and gives it a dead-letter queue, for slay-retry.
 """
+
+from typing import Optional
 
 from aws_cdk import Duration
 from aws_cdk import aws_lambda as lambda_
+from aws_cdk import aws_sqs as sqs
 from aws_cdk import aws_stepfunctions as sfn
 from aws_cdk import aws_stepfunctions_tasks as tasks
 from constructs import Construct
@@ -26,7 +34,38 @@ from constructs import Construct
 TIMEOUT_ERRORS = ("States.Timeout", "Sandbox.Timedout")
 
 
-def retry_loop(scope: Construct, construct_id: str, executor: lambda_.IFunction) -> sfn.IChainable:
+def deferrable_loop(
+    scope: Construct, construct_id: str, executor: lambda_.IFunction, dead_letters: sqs.IQueue
+) -> sfn.IChainable:
+    """
+    Build slay-retry's states under a new construct and return its first
+    state: a wait until $.at when the input has it, then the loop, which
+    sends a dead letter after a failed last attempt if
+    $.retry.dead_letter is true.
+
+    Args:
+        scope: Where the states go
+        construct_id: Id of the construct that holds the states
+        executor: The Lambda each attempt invokes
+        dead_letters: The queue for the dead letters
+    """
+    group = Construct(scope, construct_id)
+    attempt = retry_loop(group, "Loop", executor, dead_letters)
+
+    wait = sfn.Wait(group, "Wait until", time=sfn.WaitTime.timestamp_path("$.at"))
+    wait.next(attempt)
+    delayed = sfn.Choice(group, "Delayed?")
+    delayed.when(sfn.Condition.is_present("$.at"), wait)
+    delayed.otherwise(attempt)
+    return delayed
+
+
+def retry_loop(
+    scope: Construct,
+    construct_id: str,
+    executor: lambda_.IFunction,
+    dead_letters: Optional[sqs.IQueue] = None,
+) -> sfn.IChainable:
     """
     Build the loop's states under a new construct and return its first state.
 
@@ -34,6 +73,9 @@ def retry_loop(scope: Construct, construct_id: str, executor: lambda_.IFunction)
         scope: Where the states go
         construct_id: Id of the construct that holds the states
         executor: The Lambda each attempt invokes
+        dead_letters: A queue for a dead letter after a failed last
+            attempt, when the input's retry.dead_letter is true; None for
+            none
     """
     loop = Construct(scope, construct_id)
 
@@ -116,18 +158,53 @@ def retry_loop(scope: Construct, construct_id: str, executor: lambda_.IFunction)
     next_attempt.next(wait)
     wait.next(attempt)
 
-    raised_out = report("Raised", sfn.JsonPath.object_at("$.result.Payload"))
-    lambda_error = report(
-        "Lambda error",
-        {
-            "status": "lambda_error",
-            "errorType": sfn.JsonPath.string_at("$.caught.Error"),
-            "errorMessage": sfn.JsonPath.string_at("$.caught.Cause"),
-        },
-    )
+    raised_response = sfn.JsonPath.object_at("$.result.Payload")
+    lambda_error_response = {
+        "status": "lambda_error",
+        "errorType": sfn.JsonPath.string_at("$.caught.Error"),
+        "errorMessage": sfn.JsonPath.string_at("$.caught.Cause"),
+    }
+    raised_out = report("Raised", raised_response)
+    lambda_error = report("Lambda error", lambda_error_response)
     give_up = sfn.Choice(loop, "Give up")
     give_up.when(sfn.Condition.string_equals("$.class", "failure"), raised_out)
     give_up.otherwise(lambda_error)
+
+    last_attempt = give_up
+    if dead_letters is not None:
+
+        def send(name: str, response, then: sfn.IChainable) -> sfn.IChainable:
+            """A dead letter with this response, then the report"""
+            body = {
+                "execution": sfn.JsonPath.string_at("$$.Execution.Id"),
+                "call": sfn.JsonPath.object_at("$.call"),
+                "response": response,
+            }
+            return tasks.SqsSendMessage(
+                loop,
+                name,
+                queue=dead_letters,
+                message_body=sfn.TaskInput.from_object(body),
+                result_path=sfn.JsonPath.DISCARD,
+            ).next(then)
+
+        # And stops at the first false rule, so a missing flag is no
+        # error. The flag is in retry because Next attempt rebuilds the
+        # state from named fields.
+        flagged = (
+            sfn.Condition.is_present("$.retry.dead_letter"),
+            sfn.Condition.boolean_equals("$.retry.dead_letter", True),
+        )
+        last_attempt = sfn.Choice(loop, "Dead letter?")
+        last_attempt.when(
+            sfn.Condition.and_(*flagged, sfn.Condition.string_equals("$.class", "failure")),
+            send("Send raised", raised_response, raised_out),
+        )
+        last_attempt.when(
+            sfn.Condition.and_(*flagged),
+            send("Send lambda error", lambda_error_response, lambda_error),
+        )
+        last_attempt.otherwise(give_up)
 
     retry = sfn.Choice(loop, "Retry?")
     retry.when(
@@ -137,7 +214,7 @@ def retry_loop(scope: Construct, construct_id: str, executor: lambda_.IFunction)
         ),
         next_attempt,
     )
-    retry.otherwise(give_up)
+    retry.otherwise(last_attempt)
     check.next(retry)
 
     attempt.next(raised)

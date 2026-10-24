@@ -2,12 +2,14 @@
 The client policies against the AWS requests a client sends.
 
 A recorder notes every request that slay sends from the test's thread
-while backend auto-detection, run(), add_retry, apply(), a job and the
-cache run in moto. IAM_POLICIES/SlayClient.json and IAM_POLICY.json must
-allow each one. Requests from moto's state machine threads come from the
-state machines' roles, not from the client, so the recorder skips them.
+while backend auto-detection, run(), add_retry, apply(), a job, the
+cache, deferred calls and schedules run in moto. IAM_POLICIES/SlayClient.json
+and IAM_POLICY.json must allow each one. Requests from moto's state machine
+threads come from the state machines' roles, not from the client, so the
+recorder skips them.
 """
 
+import datetime as dt
 import fnmatch
 import json
 import threading
@@ -16,9 +18,10 @@ from pathlib import Path
 import boto3
 import pytest
 import slay
+import slay.core.context
 from slay.backends.lambda_ import LambdaBackend
 from slay.core.context import Context
-from synth import ACCOUNT, BUCKET, REGION, machine_arn
+from synth import ACCOUNT, BUCKET, DEAD_LETTER_ARN, REGION, machine_arn
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -37,6 +40,14 @@ CLIENT_ACTIONS = {
     "states:DescribeExecution",
     "s3:GetObject",
     "s3:PutObject",
+    "s3:ListBucket",
+    "s3:DeleteObject",
+    "scheduler:CreateSchedule",
+    "scheduler:UpdateSchedule",
+    "scheduler:GetSchedule",
+    "scheduler:DeleteSchedule",
+    "scheduler:ListSchedules",
+    "iam:PassRole",
 }
 
 EXECUTOR = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:slay-executor"
@@ -86,31 +97,63 @@ def _object(params):
     return f"arn:aws:s3:::{params['Bucket']}/{params['Key']}"
 
 
-# (service, operation) -> (IAM action, the resource ARN from the request
-# parameters); None for an operation that needs no permission
+def _copy_source(params):
+    source = params["CopySource"]
+    if isinstance(source, str):
+        bucket, _, key = source.lstrip("/").partition("/")
+    else:
+        bucket, key = source["Bucket"], source["Key"]
+    return f"arn:aws:s3:::{bucket}/{key}"
+
+
+def _schedule(params):
+    group = params.get("GroupName", "default")
+    return f"arn:aws:scheduler:{REGION}:{ACCOUNT}:schedule/{group}/{params['Name']}"
+
+
+def _one(action, resource):
+    """A request that IAM checks once: action on the resource of its parameters"""
+    return lambda params: [(action, resource(params))]
+
+
+def _schedule_write(action):
+    """A request that writes a schedule, and passes its target's role"""
+    return lambda params: [(action, _schedule(params)), ("iam:PassRole", params["Target"]["RoleArn"])]
+
+
+# (service, operation) -> a function of the request parameters that gives
+# every (IAM action, resource ARN) that IAM checks for the request
 IAM_REQUESTS = {
-    ("sts", "GetCallerIdentity"): None,
-    ("lambda", "GetFunction"): ("lambda:GetFunction", _function),
-    ("lambda", "Invoke"): ("lambda:InvokeFunction", _function),
-    ("states", "StartExecution"): ("states:StartExecution", lambda p: p["stateMachineArn"]),
-    ("states", "DescribeExecution"): ("states:DescribeExecution", lambda p: p["executionArn"]),
-    ("s3", "GetObject"): ("s3:GetObject", _object),
-    ("s3", "HeadObject"): ("s3:GetObject", _object),
-    ("s3", "PutObject"): ("s3:PutObject", _object),
-    ("s3", "ListObjectsV2"): ("s3:ListBucket", lambda p: f"arn:aws:s3:::{p['Bucket']}"),
+    ("sts", "GetCallerIdentity"): lambda params: [],
+    ("lambda", "GetFunction"): _one("lambda:GetFunction", _function),
+    ("lambda", "Invoke"): _one("lambda:InvokeFunction", _function),
+    ("states", "StartExecution"): _one("states:StartExecution", lambda p: p["stateMachineArn"]),
+    ("states", "DescribeExecution"): _one("states:DescribeExecution", lambda p: p["executionArn"]),
+    ("s3", "GetObject"): _one("s3:GetObject", _object),
+    ("s3", "HeadObject"): _one("s3:GetObject", _object),
+    ("s3", "PutObject"): _one("s3:PutObject", _object),
+    ("s3", "CopyObject"): lambda p: [("s3:GetObject", _copy_source(p)), ("s3:PutObject", _object(p))],
+    ("s3", "DeleteObject"): _one("s3:DeleteObject", _object),
+    ("s3", "DeleteObjects"): lambda p: [
+        ("s3:DeleteObject", f"arn:aws:s3:::{p['Bucket']}/{entry['Key']}")
+        for entry in p["Delete"]["Objects"]
+    ],
+    ("s3", "ListObjectsV2"): _one("s3:ListBucket", lambda p: f"arn:aws:s3:::{p['Bucket']}"),
+    ("scheduler", "GetSchedule"): _one("scheduler:GetSchedule", _schedule),
+    ("scheduler", "CreateSchedule"): _schedule_write("scheduler:CreateSchedule"),
+    ("scheduler", "UpdateSchedule"): _schedule_write("scheduler:UpdateSchedule"),
+    ("scheduler", "DeleteSchedule"): _one("scheduler:DeleteSchedule", _schedule),
+    # ListSchedules has no resource-level permissions
+    ("scheduler", "ListSchedules"): lambda params: [("scheduler:ListSchedules", "*")],
 }
 
 
-def iam_request(service, operation, params):
-    """The (action, resource) that IAM checks for a request, or None"""
+def iam_requests(service, operation, params):
+    """Every (action, resource) that IAM checks for a request"""
     assert (service, operation) in IAM_REQUESTS, (
         f"{service}:{operation} has no IAM action in this test; add it to IAM_REQUESTS"
     )
-    entry = IAM_REQUESTS[(service, operation)]
-    if entry is None:
-        return None
-    action, resource = entry
-    return action, resource(params)
+    return IAM_REQUESTS[(service, operation)](params)
 
 
 class Recorder:
@@ -158,9 +201,18 @@ def run_client(backend):
     cached(large).get()  # a miss: runs, then writes the entry
     cached(large).get()  # a hit: reads the entry, checks the result exists
 
+    later = slay.run_later(shout, large)
+    slay.attach(later.id).result()
+    slay.run_at(dt.timedelta(seconds=-1), shout, "w").result()
+
+    slay.schedule("policy", "rate(1 hour)", shout, large)  # copies large
+    slay.reschedule("policy", "rate(2 hours)", shout, large + "y")  # deletes a copy
+    slay.schedules()
+    slay.unschedule("policy")
+
 
 @pytest.fixture
-def client_requests(fanout, stand_in, monkeypatch):
+def client_requests(fanout, stand_in, monkeypatch, schedule_group, utc):
     """The (action, resource) pairs of the requests run_client sends"""
     recorder = Recorder()
     events = boto3._get_default_session().events
@@ -168,11 +220,11 @@ def client_requests(fanout, stand_in, monkeypatch):
     try:
         backend = LambdaBackend()
         backend.lambda_client = RecordedLambda(stand_in, recorder)
-        monkeypatch.setattr(slay.api, "get_backend", lambda: backend)
+        monkeypatch.setattr(slay.core.context._context, "_backend", backend)
         run_client(backend)
     finally:
         events.unregister("before-parameter-build", recorder.on_parameters)
-    return {iam_request(*request) for request in recorder.requests} - {None}
+    return {pair for request in recorder.requests for pair in iam_requests(*request)}
 
 
 @pytest.mark.parametrize("name", POLICIES)
@@ -198,12 +250,22 @@ class TestSlayClient:
             ("states:StartExecution", machine_arn("other")),
             ("states:StopExecution", f"arn:aws:states:{REGION}:{ACCOUNT}:execution:slay-fanout:x"),
             ("s3:DeleteObject", f"arn:aws:s3:::{BUCKET}/refs/ab/abc.bin"),
+            ("s3:DeleteObject", f"arn:aws:s3:::{BUCKET}/cache/ab/abc.json"),
             ("s3:GetObject", "arn:aws:s3:::other-bucket/refs/ab/abc.bin"),
             ("iam:PassRole", f"arn:aws:iam::{ACCOUNT}:role/slay-executor"),
+            ("scheduler:CreateSchedule", f"arn:aws:scheduler:{REGION}:{ACCOUNT}:schedule/default/x"),
+            ("scheduler:DeleteScheduleGroup", f"arn:aws:scheduler:{REGION}:{ACCOUNT}:schedule-group/slay"),
+            ("sqs:ReceiveMessage", DEAD_LETTER_ARN),
         ],
     )
     def test_grants_nothing_else(self, action, resource):
         assert not allows(load_policy("SlayClient"), action, resource)
+
+    def test_deletes_the_copies_of_a_schedule(self):
+        """reschedule() and unschedule() delete under schedules/ and nowhere else"""
+        policy = load_policy("SlayClient")
+
+        assert allows(policy, "s3:DeleteObject", f"arn:aws:s3:::{BUCKET}/schedules/prices/abc.bin")
 
     def test_fits_one_user(self):
         """A user may hold 2,048 characters of inline policy"""

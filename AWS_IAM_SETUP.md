@@ -11,8 +11,9 @@ Slay requires permissions to create and manage:
 - **CloudFormation stacks** for infrastructure management
 - **IAM roles** for Lambda execution
 
-and, to use it, permissions to invoke the Lambda function and to run the
-**Step Functions** state machines.
+and, to use it, permissions to invoke the Lambda function, to run the
+**Step Functions** state machines, and to manage **EventBridge
+Scheduler** schedules.
 
 ## Quick Setup
 
@@ -127,12 +128,30 @@ aws iam attach-user-policy \
 
 | Action | Purpose |
 |--------|---------|
-| `states:StartExecution` | Run `add_retry` calls and `apply()` |
+| `states:StartExecution` | Run `add_retry` calls, `apply()`, `run_later()` and `run_at()` |
 | `states:DescribeExecution` | Wait for those executions |
 
 **Resource Patterns:**
 - `arn:aws:states:*:ACCOUNT_ID:stateMachine:slay-retry` and `slay-fanout`
 - `arn:aws:states:*:ACCOUNT_ID:execution:slay-retry:*` and `slay-fanout:*`
+
+### EventBridge Scheduler (Using slay)
+
+| Action | Purpose |
+|--------|---------|
+| `scheduler:CreateSchedule` | `schedule()` and `reschedule()` |
+| `scheduler:UpdateSchedule` | `reschedule()` |
+| `scheduler:GetSchedule` | `schedule()` checks that the name is free |
+| `scheduler:DeleteSchedule` | `unschedule()` |
+| `scheduler:ListSchedules` | `schedules()` |
+| `iam:PassRole` | Give Scheduler the role `slay-scheduler` |
+| `s3:DeleteObject` | `reschedule()` and `unschedule()` delete a schedule's copies |
+
+**Resource Patterns:**
+- `arn:aws:scheduler:*:ACCOUNT_ID:schedule/slay/*`
+- `*` for `scheduler:ListSchedules`, which has no resource-level rights
+- `arn:aws:iam::ACCOUNT_ID:role/slay-scheduler`
+- `arn:aws:s3:::slay-storage-*/schedules/*`
 
 ### IAM (Permissions)
 

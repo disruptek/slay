@@ -5,12 +5,23 @@ LambdaBackend encodes each call with encode_call(), or a fan-out's items
 with encode_arguments(). runtime/handler.py decodes a call with
 decode_call() and sends its result back as ref_to_dict(). Both sides
 import this module, so the format has one definition.
+
+encode_loop_input() writes the input of the slay-retry state machine,
+which LambdaBackend starts and a schedule holds.
 """
 
-from typing import Any
+import math
+from typing import TYPE_CHECKING, Any, Optional
 
 from slay.core.reference import Reference
 from slay.core.serializer import TypeInfo
+
+if TYPE_CHECKING:
+    from slay.wrappers import Retried
+
+# Seconds per attempt when add_retry sets no timeout: more than the
+# Lambda's 14-minute timeout, so the Lambda's own limit ends an attempt
+DEFAULT_ATTEMPT_TIMEOUT = 900
 
 
 def ref_to_dict(ref: Reference) -> dict[str, Any]:
@@ -51,6 +62,46 @@ def encode_call(
 ) -> dict[str, Any]:
     """Encode one function call as a JSON-serializable event"""
     return {"func_ref": ref_to_dict(func_ref), **encode_arguments(args, kwargs)}
+
+
+def encode_retry(retry: Optional["Retried"], dead_letter: bool = False) -> dict[str, Any]:
+    """
+    The retry part of the loop's input; Wait takes whole seconds. Without
+    a policy, one attempt with the Lambda's own timeout. With dead_letter,
+    slay-retry sends a dead letter after a failed last attempt.
+    """
+    if retry is None:
+        encoded = {"waits": [], "retry_on": [], "timeout": DEFAULT_ATTEMPT_TIMEOUT}
+    else:
+        encoded = {
+            "waits": [math.ceil(wait) for wait in retry.waits()],
+            "retry_on": retry.retry_on(),
+            "timeout": retry.timeout or DEFAULT_ATTEMPT_TIMEOUT,
+        }
+    if dead_letter:
+        encoded["dead_letter"] = True
+    return encoded
+
+
+def encode_loop_input(
+    call: dict[str, Any],
+    retry: Optional["Retried"],
+    dead_letter: bool = False,
+    at: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    The input of slay-retry for an encode_call() call: index 0, the retry
+    part, attempt 0, and at, the time of the first attempt, if given
+    """
+    document = {
+        "index": 0,
+        "call": call,
+        "retry": encode_retry(retry, dead_letter),
+        "attempt": 0,
+    }
+    if at is not None:
+        document["at"] = at
+    return document
 
 
 def decode_call(

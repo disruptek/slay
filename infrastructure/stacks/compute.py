@@ -1,4 +1,4 @@
-"""AWS CDK Compute Stack - Lambda functions for slay"""
+"""AWS CDK Compute Stack - Lambda, state machines, dead letters and schedules"""
 
 import sys
 from aws_cdk import (
@@ -11,18 +11,23 @@ from aws_cdk import (
     Size,
     aws_lambda as lambda_,
     aws_iam as iam,
+    aws_scheduler as scheduler,
+    aws_sqs as sqs,
     aws_stepfunctions as sfn,
 )
 from constructs import Construct
 
 from stacks.bundling import RUNTIME_DIR, LocalBundler
 from stacks.fanout import RESULT_WRITER_V2_FLAG, fanout
-from stacks.retry_loop import retry_loop
+from stacks.retry_loop import deferrable_loop
 
 # Fixed names: the client builds the ARNs from its region and account
 EXECUTOR_FUNCTION = "slay-executor"
 RETRY_STATE_MACHINE = "slay-retry"
 FANOUT_STATE_MACHINE = "slay-fanout"
+SCHEDULE_GROUP = "slay"
+SCHEDULER_ROLE = "slay-scheduler"
+DEAD_LETTER_QUEUE = "slay-dead-letter"
 # Every state machine name above starts with this
 STATE_MACHINE_PREFIX = "slay-"
 
@@ -147,18 +152,46 @@ class ComputeStack(Stack):
 
         CfnOutput(self, "ExecutorFunction", value=self.executor.function_name)
 
-        # Retried calls: a loop that the execution input controls
+        # The last failed attempt of a deferred or scheduled call
+        self.dead_letters = sqs.Queue(
+            self,
+            "DeadLetters",
+            queue_name=DEAD_LETTER_QUEUE,
+            retention_period=Duration.days(14),
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+        )
+
+        CfnOutput(self, "DeadLetterQueue", value=self.dead_letters.queue_name)
+
+        # Retried, deferred and scheduled calls: a loop that the execution
+        # input controls, after an optional wait
         self.retry_machine = sfn.StateMachine(
             self,
             "RetryMachine",
             state_machine_name=RETRY_STATE_MACHINE,
             state_machine_type=sfn.StateMachineType.STANDARD,
             definition_body=sfn.DefinitionBody.from_chainable(
-                retry_loop(self, "RetryLoop", self.executor)
+                deferrable_loop(self, "RetryLoop", self.executor, self.dead_letters)
             ),
         )
 
         CfnOutput(self, "RetryStateMachine", value=self.retry_machine.state_machine_name)
+
+        # Schedules: clients create them in this group, and Scheduler
+        # starts slay-retry through this role, which clients pass by name
+        schedules = scheduler.CfnScheduleGroup(self, "Schedules", name=SCHEDULE_GROUP)
+        scheduler_role = iam.Role(
+            self,
+            "SchedulerRole",
+            role_name=SCHEDULER_ROLE,
+            assumed_by=iam.ServicePrincipal(
+                "scheduler.amazonaws.com",
+                conditions={"StringEquals": {"aws:SourceAccount": self.account}},
+            ),
+        )
+        self.retry_machine.grant_start_execution(scheduler_role)
+
+        CfnOutput(self, "ScheduleGroup", value=schedules.name)
 
         # Many calls: a Distributed Map whose children run the same loop
         self.fanout_machine = sfn.StateMachine(

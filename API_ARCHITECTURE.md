@@ -109,6 +109,21 @@ On Lambda, `apply()` and `start_apply()` run one Step Functions execution
 with a Distributed Map. The README sections "Fan-out" and "Jobs" have the
 details.
 
+### Deferred and Scheduled Calls
+```python
+# One call that starts now, or at a time; the client need not wait
+job = slay.run_later(fn, arg)
+job = slay.run_at(datetime.timedelta(hours=1), fn, arg)
+result_ref = slay.attach(job.id).result()
+
+# The same call again and again, on an EventBridge Scheduler expression
+slay.schedule("nightly", "cron(0 2 * * ? *)", fn, arg)
+slay.unschedule("nightly")
+```
+On Lambda, each call or run is one execution of the retry state machine.
+A last attempt that fails sends a dead letter to an SQS queue. The README
+section "Later, at a time, and on a schedule" has the details.
+
 ### Function Composition
 ```python
 # Store function
@@ -221,8 +236,6 @@ The old API (`run_remotely`, `run_parallel`) is completely removed in v2.0:
 The architecture supports future additions:
 - Async execution: `await fn(arg)`
 - Streaming: `fn.stream(items)` returns async iterator
-- Job tracking for single calls: `job = fn.spawn(arg); job.status();
-  job.result()` (`start_apply()` covers many items)
 - Custom executors: Pluggable execution strategies
 
 All without changing the core `put/get/run/apply` primitives.

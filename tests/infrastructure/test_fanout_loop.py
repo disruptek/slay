@@ -15,6 +15,8 @@ import uuid
 import boto3
 import pytest
 import slay
+from executions import run_execution
+from functions import fail_odd
 from run_log import logged, runs
 from slay.core.wire import dict_to_ref, ref_to_dict
 from synth import BUCKET, machine_arn
@@ -38,16 +40,7 @@ def run_fanout(sfn, func_ref, items, waits=(), max_concurrency=0):
         "max_concurrency": max_concurrency,
         "item_count": len(items),
     }
-    execution = sfn.start_execution(
-        stateMachineArn=ARN, name=uuid.uuid4().hex, input=json.dumps(document)
-    )["executionArn"]
-    deadline = time.monotonic() + 60
-    while True:
-        described = sfn.describe_execution(executionArn=execution)
-        if described["status"] != "RUNNING":
-            return described
-        assert time.monotonic() < deadline, "the execution did not end"
-        time.sleep(0.05)
+    return run_execution(sfn, ARN, json.dumps(document))
 
 
 def child_outputs(described):
@@ -67,12 +60,6 @@ def child_outputs(described):
 @pytest.fixture
 def log(tmp_path):
     return tmp_path / "runs.log"
-
-
-def fail_odd(x):
-    if x % 2:
-        raise ValueError(str(x))
-    return x
 
 
 class TestResults:

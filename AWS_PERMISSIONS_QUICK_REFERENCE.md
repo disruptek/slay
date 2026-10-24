@@ -33,7 +33,8 @@ Users who only run slay need less: `IAM_POLICIES/SlayClient.json` (see
 |---------|-----|-----------------|
 | **S3** | Data storage | Create/delete buckets, read/write objects |
 | **Lambda** | Code execution | Create/delete functions, update code, invoke |
-| **Step Functions** | Retries and fan-out | Start and describe executions |
+| **Step Functions** | Retries, fan-out and deferred calls | Start and describe executions |
+| **EventBridge Scheduler** | Schedules | Create, update, get, delete and list schedules |
 | **IAM** | Permissions | Create roles, pass roles to Lambda |
 | **DynamoDB** | Metadata | Create/delete tables |
 | **CloudFormation** | Deployment | Create/update/delete stacks |
@@ -79,6 +80,16 @@ Users who only run slay need less: `IAM_POLICIES/SlayClient.json` (see
 ```
 ✓ states:StartExecution      (slay-retry, slay-fanout)
 ✓ states:DescribeExecution   (their executions)
+```
+
+### EventBridge Scheduler
+```
+✓ scheduler:CreateSchedule   (schedules of the group slay)
+✓ scheduler:UpdateSchedule
+✓ scheduler:GetSchedule
+✓ scheduler:DeleteSchedule
+✓ scheduler:ListSchedules    (on *)
+✓ iam:PassRole               (the role slay-scheduler)
 ```
 
 ### IAM

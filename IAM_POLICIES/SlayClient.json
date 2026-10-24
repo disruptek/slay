@@ -2,7 +2,6 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "SlayExecutor",
       "Effect": "Allow",
       "Action": [
         "lambda:GetFunction",
@@ -13,46 +12,67 @@
       ]
     },
     {
-      "Sid": "SlayStateMachines",
       "Effect": "Allow",
       "Action": [
-        "states:StartExecution"
-      ],
-      "Resource": [
-        "arn:aws:states:*:026792689263:stateMachine:slay-retry",
-        "arn:aws:states:*:026792689263:stateMachine:slay-fanout"
-      ]
-    },
-    {
-      "Sid": "SlayExecutions",
-      "Effect": "Allow",
-      "Action": [
+        "states:StartExecution",
         "states:DescribeExecution"
       ],
       "Resource": [
+        "arn:aws:states:*:026792689263:stateMachine:slay-retry",
+        "arn:aws:states:*:026792689263:stateMachine:slay-fanout",
         "arn:aws:states:*:026792689263:execution:slay-retry:*",
         "arn:aws:states:*:026792689263:execution:slay-fanout:*"
       ]
     },
     {
-      "Sid": "SlayStorageObjects",
       "Effect": "Allow",
       "Action": [
         "s3:GetObject",
-        "s3:PutObject"
+        "s3:PutObject",
+        "s3:ListBucket"
       ],
       "Resource": [
+        "arn:aws:s3:::slay-storage-*",
         "arn:aws:s3:::slay-storage-*/*"
       ]
     },
     {
-      "Sid": "SlayStorageList",
       "Effect": "Allow",
       "Action": [
-        "s3:ListBucket"
+        "s3:DeleteObject"
       ],
       "Resource": [
-        "arn:aws:s3:::slay-storage-*"
+        "arn:aws:s3:::slay-storage-*/schedules/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "scheduler:CreateSchedule",
+        "scheduler:UpdateSchedule",
+        "scheduler:GetSchedule",
+        "scheduler:DeleteSchedule"
+      ],
+      "Resource": [
+        "arn:aws:scheduler:*:026792689263:schedule/slay/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "scheduler:ListSchedules"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::026792689263:role/slay-scheduler"
       ]
     }
   ]

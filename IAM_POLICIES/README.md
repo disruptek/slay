@@ -102,9 +102,12 @@ The `manage-policies.sh` script handles all policy operations for groups or user
 | **SlayDynamoDB.json** | 331 | DynamoDB table management |
 | **SlayECRAssets.json** | 620 | ECR repository + CDK asset buckets |
 | **SlayBootstrap.json** | 243 | CDK bootstrap SSM parameters |
-| **SlayClient.json** | 857 | Use slay: invoke the executor, run the state machines, read and write the bucket |
+| **SlayClient.json** | 1,131 | Use slay: invoke the executor, run the state machines, read and write the bucket, manage schedules |
 
-**Total:** 4,799 characters across 8 policies.
+**Total:** 5,073 characters across 8 policies.
+
+SlayClient has no `Sid` fields: without them, all eight policies fit on
+one group.
 
 **Limits:** IAM adds up all the inline policies of one user, group or
 role, and does not count whitespace. A group may hold 5,120 characters
@@ -197,10 +200,13 @@ Apply any one of them with the command of Option 3, with its name.
 **Permissions:** `lambda:GetFunction` and `lambda:InvokeFunction` on
 `slay-executor`; `states:StartExecution` on `slay-retry` and
 `slay-fanout`, and `states:DescribeExecution` on their executions;
-`s3:GetObject`, `s3:PutObject` and `s3:ListBucket` on the storage bucket
+`s3:GetObject`, `s3:PutObject` and `s3:ListBucket` on the storage bucket,
+and `s3:DeleteObject` on its `schedules/` prefix; the Scheduler actions
+on the schedules of the group `slay` (`scheduler:ListSchedules` on `*`);
+`iam:PassRole` on the role `slay-scheduler`
 **Used for:** Running functions on Lambda: `run()`, `add_retry`,
-`apply()`, jobs and the result cache (see "Permissions" in
-[../README.md](../README.md))
+`apply()`, jobs, `run_later()`, `run_at()`, schedules and the result
+cache (see "Permissions" in [../README.md](../README.md))
 **Minimum required:** Yes, to use slay
 
 ## Minimum Setup (Bare Essentials)

@@ -10,21 +10,32 @@ the Lambda once per attempt, and polls the execution until it ends. Many
 calls are one execution of slay-fanout: the client writes the calls to
 the storage bucket, and a Distributed Map runs each through the same loop
 and writes the outputs back.
+
+A deferred call (start_one) is a slay-retry execution that the client
+does not poll; a schedule starts one per run (backends/schedules.py).
 """
 
 import json
-import math
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
 import boto3
 
 from slay.backends.base import ExecutorBackend
+from slay.backends.schedules import SCHEDULER_ROLE, Schedules
 from slay.core.reference import Reference
 from slay.core.storage import open_bucket
-from slay.core.wire import dict_to_ref, encode_arguments, encode_call, ref_to_dict
+from slay.core.wire import (
+    dict_to_ref,
+    encode_arguments,
+    encode_call,
+    encode_loop_input,
+    encode_retry,
+    ref_to_dict,
+)
 from slay.exceptions import RemoteExecutionError
 
 if TYPE_CHECKING:
@@ -36,9 +47,8 @@ EXECUTOR_FUNCTION = "slay-executor"
 RETRY_STATE_MACHINE = "slay-retry"
 FANOUT_STATE_MACHINE = "slay-fanout"
 
-# Seconds per attempt when add_retry sets no timeout: more than the
-# Lambda's 14-minute timeout, so the Lambda's own limit ends an attempt
-DEFAULT_ATTEMPT_TIMEOUT = 900
+# What a job of each state machine holds, for the errors of a wrong kind
+_JOB_KINDS = {RETRY_STATE_MACHINE: "one call", FANOUT_STATE_MACHINE: "many calls"}
 
 # Seconds between DescribeExecution calls: the first wait, and the longest
 FIRST_POLL = 0.25
@@ -52,6 +62,7 @@ class LambdaBackend(ExecutorBackend):
         self.lambda_client = boto3.client("lambda")
         self.sfn_client = boto3.client("stepfunctions")
         self.sts_client = boto3.client("sts")
+        self.scheduler_client = boto3.client("scheduler")
         self.function_name = EXECUTOR_FUNCTION
         self.region = self.sfn_client.meta.region_name
         self._account: Optional[str] = None
@@ -102,10 +113,9 @@ class LambdaBackend(ExecutorBackend):
         """
         payload = encode_call(func_ref, args, kwargs)
         if retry is None:
-            response = self._invoke(payload)
-        else:
-            response = self._run_retry_loop(payload, retry)
-        return _result(response)
+            return _result(self._invoke(payload))
+        document = encode_loop_input(payload, retry)
+        return self.job_result(self._start(RETRY_STATE_MACHINE, uuid.uuid4().hex, document))
 
     def execute_many(
         self,
@@ -161,7 +171,7 @@ class LambdaBackend(ExecutorBackend):
         document = {
             "items_key": items_key,
             "func_ref": ref_to_dict(func_ref),
-            "retry": _retry_input(retry),
+            "retry": encode_retry(retry),
             "max_concurrency": max_concurrent or 0,
             "item_count": len(args_list),
         }
@@ -182,12 +192,14 @@ class LambdaBackend(ExecutorBackend):
         and decode them in item order.
 
         Raises:
+            ValueError: If the job is not a slay-fanout execution
             Exception: The error of the lowest failing index, as execute()
                 raises it
             RemoteExecutionError: If the execution ends in another status
                 than SUCCEEDED, or an item has no result
             StorageError: If a result file cannot be read
         """
+        _check_kind(job_id, FANOUT_STATE_MACHINE)
         described = self._wait_for(job_id)
         output = _succeeded_output(job_id, described)
         count = json.loads(described["input"])["item_count"]
@@ -206,6 +218,83 @@ class LambdaBackend(ExecutorBackend):
                 raise RemoteExecutionError(message=f"{job_id} has no result for item {index}")
             results.append(_result(responses[index]))
         return results
+
+    def start_one(
+        self,
+        func_ref: Reference,
+        args: list[Reference],
+        kwargs: dict[str, Reference],
+        retry: Optional["Retried"] = None,
+        at: Optional[datetime] = None,
+    ) -> str:
+        """
+        Start the call as a slay-retry execution that sends a dead letter
+        when its last attempt fails, and return the execution ARN. With
+        at, an aware datetime, the first attempt waits until then.
+
+        Raises:
+            RemoteExecutionError: If the execution cannot start
+        """
+        document = encode_loop_input(
+            encode_call(func_ref, args, kwargs),
+            retry,
+            dead_letter=True,
+            at=None if at is None else _timestamp(at),
+        )
+        return self._start(RETRY_STATE_MACHINE, uuid.uuid4().hex, document)
+
+    def job_result(self, job_id: str) -> Reference:
+        """
+        Wait for the job's execution, then return its result or raise as
+        execute() does.
+
+        Raises:
+            ValueError: If the job is not a slay-retry execution
+            RemoteExecutionError: As execute() raises it, and if the
+                execution ends in another status than SUCCEEDED
+        """
+        _check_kind(job_id, RETRY_STATE_MACHINE)
+        return _result(_succeeded_output(job_id, self._wait_for(job_id))["response"])
+
+    def schedule(
+        self,
+        name: str,
+        expression: str,
+        func_ref: Reference,
+        args: list[Reference],
+        kwargs: dict[str, Reference],
+        retry: Optional["Retried"] = None,
+        replace: bool = False,
+    ) -> None:
+        """
+        Create, or with replace replace, the EventBridge Scheduler schedule
+        of this name, whose runs start slay-retry (see Schedules.put)
+
+        Raises:
+            StorageError: If SLAY_STORAGE_BUCKET does not name an S3 bucket
+            ValueError: Without replace, if a schedule has the name
+            RemoteExecutionError: If Scheduler refuses the request
+        """
+        self._schedules().put(name, expression, func_ref, args, kwargs, retry, replace)
+
+    def unschedule(self, name: str) -> None:
+        """
+        Delete the schedule and its copies.
+
+        Raises:
+            ValueError: If no schedule has the name
+        """
+        self._schedules().remove(name)
+
+    def schedule_names(self) -> list[str]:
+        return self._schedules().names()
+
+    def _schedules(self) -> Schedules:
+        return Schedules(
+            self.scheduler_client,
+            self._state_machine_arn(RETRY_STATE_MACHINE),
+            f"arn:aws:iam::{self._account_id()}:role/{SCHEDULER_ROLE}",
+        )
 
     def _invoke(self, payload: dict[str, Any]) -> dict[str, Any]:
         """
@@ -233,19 +322,6 @@ class LambdaBackend(ExecutorBackend):
         if response.get("FunctionError"):
             raise _function_error(body)
         return body
-
-    def _run_retry_loop(self, payload: dict[str, Any], retry: "Retried") -> dict[str, Any]:
-        """
-        Run the call in slay-retry; returns the loop's response: the
-        handler's response, or a lambda_error document.
-
-        Raises:
-            RemoteExecutionError: If the execution cannot start, cannot be
-                described, or ends in another status than SUCCEEDED
-        """
-        document = {"index": 0, "call": payload, "retry": _retry_input(retry), "attempt": 0}
-        execution = self._start(RETRY_STATE_MACHINE, uuid.uuid4().hex, document)
-        return _succeeded_output(execution, self._wait_for(execution))["response"]
 
     def _start(self, machine: str, name: str, document: dict[str, Any]) -> str:
         """
@@ -280,25 +356,42 @@ class LambdaBackend(ExecutorBackend):
             delay = min(delay * 2, LAST_POLL)
 
     def _state_machine_arn(self, machine: str) -> str:
-        """A slay state machine's ARN, from the region and the account (STS, once)"""
+        """A slay state machine's ARN, from the region and the account"""
+        return f"arn:aws:states:{self.region}:{self._account_id()}:stateMachine:{machine}"
+
+    def _account_id(self) -> str:
+        """The account of the credentials, from STS once per backend"""
         with self._account_lock:
             if self._account is None:
                 self._account = self.sts_client.get_caller_identity()["Account"]
-        return f"arn:aws:states:{self.region}:{self._account}:stateMachine:{machine}"
+        return self._account
 
 
-def _retry_input(retry: Optional["Retried"]) -> dict[str, Any]:
+def _timestamp(at: datetime) -> str:
+    """at in UTC, rounded up to a whole second, as slay-retry's Wait reads it"""
+    at = at.astimezone(timezone.utc)
+    if at.microsecond:
+        at = at.replace(microsecond=0) + timedelta(seconds=1)
+    return at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _check_kind(job_id: str, machine: str) -> None:
     """
-    The retry part of the loop's input; Wait takes whole seconds. Without
-    a policy, one attempt with the Lambda's own timeout.
+    Raise unless the job is an execution of this state machine. An
+    execution ARN is arn:aws:states:<region>:<account>:execution:<machine>:<name>.
+
+    Raises:
+        ValueError: If the job belongs to another state machine, or is not
+            an execution ARN
     """
-    if retry is None:
-        return {"waits": [], "retry_on": [], "timeout": DEFAULT_ATTEMPT_TIMEOUT}
-    return {
-        "waits": [math.ceil(wait) for wait in retry.waits()],
-        "retry_on": retry.retry_on(),
-        "timeout": retry.timeout or DEFAULT_ATTEMPT_TIMEOUT,
-    }
+    parts = job_id.split(":")
+    found = parts[6] if len(parts) == 8 and parts[5] == "execution" else None
+    if found == machine:
+        return
+    if found in _JOB_KINDS:
+        wanted = "result()" if found == RETRY_STATE_MACHINE else "results()"
+        raise ValueError(f"{job_id} is a job of {_JOB_KINDS[found]}; use {wanted}")
+    raise ValueError(f"{job_id} is not an execution of {' or '.join(_JOB_KINDS)}")
 
 
 def _succeeded_output(execution: str, described: dict[str, Any]) -> dict[str, Any]:

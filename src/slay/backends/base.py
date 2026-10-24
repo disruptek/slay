@@ -10,6 +10,7 @@ Backends handle running functions in different environments:
 """
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
 from slay.core.reference import Reference
@@ -115,8 +116,61 @@ class ExecutorBackend(ABC):
     @abstractmethod
     def job_results(self, job_id: str) -> list[Reference]:
         """
-        Wait for the job, then return its results or raise as execute_many
+        Wait for the job, then return its results or raise as execute_many.
+        A job of one call (start_one) raises ValueError.
         """
+        pass
+
+    @abstractmethod
+    def start_one(
+        self,
+        func_ref: Reference,
+        args: list[Reference],
+        kwargs: dict[str, Reference],
+        retry: Optional["Retried"] = None,
+        at: Optional[datetime] = None,
+    ) -> str:
+        """
+        Start execute as a job of one call and return its ID. With at, an
+        aware datetime, the call starts no earlier than that time.
+        """
+        pass
+
+    @abstractmethod
+    def job_result(self, job_id: str) -> Reference:
+        """
+        Wait for a job of one call, then return its result or raise as
+        execute. A job of many calls (start_many) raises ValueError.
+        """
+        pass
+
+    @abstractmethod
+    def schedule(
+        self,
+        name: str,
+        expression: str,
+        func_ref: Reference,
+        args: list[Reference],
+        kwargs: dict[str, Reference],
+        retry: Optional["Retried"] = None,
+        replace: bool = False,
+    ) -> None:
+        """
+        Run the call on an EventBridge Scheduler expression, in UTC, as a
+        job of one call each time. Without replace, a name in use raises
+        ValueError; with it, the schedule of that name is replaced or
+        created.
+        """
+        pass
+
+    @abstractmethod
+    def unschedule(self, name: str) -> None:
+        """Delete the schedule; ValueError if no schedule has the name"""
+        pass
+
+    @abstractmethod
+    def schedule_names(self) -> list[str]:
+        """The names of the schedules, sorted"""
         pass
 
     @property

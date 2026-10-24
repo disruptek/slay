@@ -8,14 +8,6 @@ from run_log import logged, runs
 from slay import add_retry, add_caching, create_reference
 
 
-@pytest.fixture
-def sleeps(monkeypatch):
-    """The seconds passed to time.sleep, which returns at once"""
-    recorded = []
-    monkeypatch.setattr("time.sleep", recorded.append)
-    return recorded
-
-
 class TestAddRetry:
     """add_retry on the local backend: an in-process loop"""
 

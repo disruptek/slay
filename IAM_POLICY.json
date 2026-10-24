@@ -114,6 +114,27 @@
       ]
     },
     {
+      "Sid": "SlaySchedules",
+      "Effect": "Allow",
+      "Action": [
+        "scheduler:CreateSchedule",
+        "scheduler:UpdateSchedule",
+        "scheduler:GetSchedule",
+        "scheduler:DeleteSchedule"
+      ],
+      "Resource": [
+        "arn:aws:scheduler:*:ACCOUNT_ID:schedule/slay/*"
+      ]
+    },
+    {
+      "Sid": "SlayScheduleList",
+      "Effect": "Allow",
+      "Action": [
+        "scheduler:ListSchedules"
+      ],
+      "Resource": "*"
+    },
+    {
       "Sid": "DynamoDBTableManagement",
       "Effect": "Allow",
       "Action": [

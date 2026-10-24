@@ -311,8 +311,8 @@ strict(13)              # raises slay.CacheMiss; nothing runs
 - **Cache-only.** `add_cache_only(fn, version=None)` reads the same
   entries. A miss raises `slay.CacheMiss` and runs nothing. In `apply()`,
   the error names the lowest missing item index.
-- **Expiry.** The bucket's lifecycle rule deletes every object after 90
-  days, entries included. On a hit whose result is stored in S3, slay
+- **Expiry.** The bucket's lifecycle rules delete values, cache entries
+  and fan-out files after 90 days. On a hit whose result is stored in S3, slay
   checks that the result object still exists. A missing object counts as
   a miss.
 - **Permissions.** Clients need `s3:ListBucket` on the bucket. Without
@@ -467,6 +467,128 @@ site-packages by value. On Lambda, slay itself is such a module. slay
 therefore makes dill store its own modules by name, so a function that
 names the `slay` module serializes in the client and in the executor.
 
+## Later, at a time, and on a schedule
+
+`run_later()` starts one call and returns a `Job` at once. `run_at()`
+does the same for a call that starts at a given time:
+
+```python
+import datetime as dt
+import slay
+
+report = slay.put(build_report)
+job = slay.run_later(report, "2026-10")
+job_id = job.id                       # on Lambda: the execution ARN
+# The client may exit now; the execution goes on.
+ref = slay.attach(job_id).result()    # waits; returns or raises as run() does
+
+slay.run_at(dt.timedelta(hours=8), report, "2026-11")
+slay.run_at(dt.datetime(2026, 12, 1, tzinfo=dt.timezone.utc), report, "2026-12")
+```
+
+- **Lambda backend.** Each call is one execution of the `slay-retry`
+  state machine. The client starts it and does not wait for it.
+- **The time.** `when` is a `datetime`, or a `timedelta` from now. A
+  naive `datetime` is local time, as `datetime.astimezone()` reads it.
+  The first attempt starts at that second; slay rounds a fraction of a
+  second up. A time in the past starts the call at once.
+- **One year.** Step Functions stops an execution after one year. A time
+  365 days or more ahead raises `ValueError`, and a `when` of another
+  type raises `TypeError`.
+- **Results.** `job.result()` waits for the call, then returns the
+  result Reference or raises as `run()` does (see [Errors](#errors)).
+  `job.status()` is as for a job of `start_apply()`: a call that raised
+  ends `"SUCCEEDED"`. `job.results()` raises `ValueError` for a job of one
+  call, and `job.result()` raises `ValueError` for a job of
+  `start_apply()`.
+- **Wrappers.** As for `start_apply()`: the settings of an `add_retry`
+  function go into the execution, and any other wrapper runs inside the
+  executor.
+- **Arguments.** Every argument after the function goes to the function,
+  so the function may take keyword arguments named `fn` or `when`.
+- **Local backend.** `run_later()` runs the call before it returns.
+  `run_at()` sleeps until the time, then runs the call. The job lives in
+  the memory of the process, as a job of `start_apply()` does.
+- **Nested calls.** A function on Lambda may call `run_later()` and
+  `run_at()`.
+
+### Dead letters
+
+When the last attempt of a call from `run_later()`, `run_at()` or a
+schedule fails, `slay-retry` sends a message to the SQS queue
+`slay-dead-letter`. The queue keeps each message for 14 days. The body is
+JSON:
+
+```
+{"execution": <the execution ARN>,
+ "call": {"func_ref": ..., "args_refs": [...], "kwargs_refs": {...}},
+ "response": <the last attempt's response, as in the execution's output>}
+```
+
+- **The last attempt.** The function raised, timed out or crashed, and
+  `add_retry` allows no more attempts (see [Retry](#retry)). Without
+  `add_retry`, the first attempt is the last. `job.result()` raises the
+  same error.
+- **Other calls.** `run()`, `apply()` and `start_apply()` send no dead
+  letter: their caller gets the error.
+- **Reading.** slay does not read the queue. Use the SQS console or
+  `aws sqs receive-message`, with rights of your own. The queue's name is
+  the `DeadLetterQueue` output of `SlayComputeStack`.
+
+### Schedules
+
+A schedule starts the same call again and again:
+
+```python
+import slay
+
+refresh = slay.put(refresh_prices)
+slay.schedule("prices", "cron(0 2 * * ? *)", refresh, region="eu")
+slay.reschedule("prices", "rate(6 hours)", refresh, region="eu")
+slay.schedules()                      # ["prices"]
+slay.unschedule("prices")
+```
+
+- **Lambda backend.** A schedule is an EventBridge Scheduler schedule in
+  the group `slay`. Each run starts a `slay-retry` execution, as
+  `run_later()` does, so `add_retry` and dead letters apply. Scheduler
+  starts the execution through the role `slay-scheduler`, which may start
+  `slay-retry` executions and do nothing else.
+- **Expressions.** `rate(...)`, `cron(...)` or `at(yyyy-mm-ddThh:mm:ss)`,
+  as EventBridge Scheduler defines them. Every expression is in UTC.
+  Scheduler checks the expression; a bad one raises
+  `RemoteExecutionError`.
+- **Names.** A name has 1 to 64 letters, digits, `-`, `_` or `.`.
+  `schedule()` raises `ValueError` for another name, or for a name that a
+  schedule has already. `reschedule()` replaces the schedule of that name,
+  or creates it.
+- **Copies.** The bucket deletes values after 90 days, and a schedule can
+  run for longer. `schedule()` and `reschedule()` therefore copy each
+  value that is stored in S3 (1 KB or more) to `schedules/<name>/` in the
+  bucket. No lifecycle rule applies there.
+  - The copied values are the function, each argument, and the inner
+    function of a wrapper. The schedule's call names the copies.
+  - A Reference inside a container, or one that a closure holds, is not
+    copied. It expires after 90 days.
+  - `reschedule()` deletes the copies that the new call does not use.
+- **Removal.** `unschedule(name)` deletes the schedule, then its copies.
+  If no schedule has that name, it deletes any copies under that name and
+  raises `ValueError`. An `at()` schedule stays after it runs, until you
+  remove it.
+- **Results.** Each run stores its result as `run()` does. Nothing reads
+  it, and it expires after 90 days. A run whose last attempt fails sends
+  a dead letter.
+- **Python version.** A function stored by dill loads only under the
+  Python minor version that wrote it. If you deploy the stack with
+  another version, each run fails with `SerializationError`. Reschedule
+  from a client with the new version.
+- **The bucket.** `SLAY_STORAGE_BUCKET` must name the stack's S3 bucket.
+  A directory raises `StorageError`, and nothing changes.
+- **Local backend.** No process outlives a schedule, so `schedule()`,
+  `reschedule()`, `unschedule()` and `schedules()` raise `SlayError`.
+- **Nested calls.** The executor's role has no Scheduler rights, so a
+  function on Lambda cannot call the schedule functions.
+
 ## Permissions
 
 A client that uses the Lambda backend needs:
@@ -476,12 +598,20 @@ A client that uses the Lambda backend needs:
   local backend;
 - `s3:GetObject`, `s3:PutObject` and `s3:ListBucket` on the storage
   bucket (see [Caching](#caching) for why `ListBucket`);
-- for `add_retry`: `states:StartExecution` on the `slay-retry` state
-  machine and `states:DescribeExecution` on its executions;
+- for `add_retry`, `run_later()` and `run_at()`: `states:StartExecution`
+  on the `slay-retry` state machine and `states:DescribeExecution` on its
+  executions;
 - for `apply()`, `start_apply()` and `attach()`: the same on the
-  `slay-fanout` state machine and its executions.
+  `slay-fanout` state machine and its executions;
+- for the schedule functions:
+  - `scheduler:CreateSchedule`, `scheduler:UpdateSchedule`,
+    `scheduler:GetSchedule` and `scheduler:DeleteSchedule` on the
+    schedules of the group `slay`;
+  - `scheduler:ListSchedules`, which IAM grants on `*` only;
+  - `iam:PassRole` on the role `slay-scheduler`;
+  - `s3:DeleteObject` on `schedules/*` in the storage bucket.
 
-slay builds the state machine ARNs from the account that
+slay builds the state machine and role ARNs from the account that
 `sts:GetCallerIdentity` returns. That call needs no permission.
 
 `IAM_POLICIES/SlayClient.json` grants these rights, and `IAM_POLICY.json`
@@ -549,16 +679,18 @@ c/
 │   ├── backends/              # Execution backends
 │   │   ├── base.py            # Abstract backend
 │   │   ├── local.py           # Local execution
-│   │   └── lambda_.py         # AWS Lambda
+│   │   ├── lambda_.py         # AWS Lambda
+│   │   └── schedules.py       # EventBridge Scheduler and the copies
 │   ├── api.py                 # Public API
-│   ├── jobs.py                # Job (start_apply, attach)
+│   ├── deferred.py            # run_later, run_at and the schedules
+│   ├── jobs.py                # Job (start_apply, run_later, attach)
 │   ├── wrappers.py            # Function composition
 │   └── exceptions.py          # Exception types
 ├── infrastructure/            # AWS CDK infrastructure
 │   ├── app.py                 # CDK app
 │   ├── stacks/                # CDK stacks
 │   │   ├── storage.py         # S3 + DynamoDB
-│   │   ├── compute.py         # Lambda function and state machines
+│   │   ├── compute.py         # Lambda, state machines, dead letters, schedules
 │   │   ├── retry_loop.py      # The retry loop (slay-retry)
 │   │   └── fanout.py          # The Distributed Map (slay-fanout)
 │   └── cdk.json               # CDK config
@@ -626,6 +758,8 @@ pytest tests/ --cov=slay --cov-report=html
   registers executions or checks for kills, so `kill_all()` and the other
   functions log a message and stop nothing. To stop runaway Lambda work,
   set the function's reserved concurrency to 0 in AWS.
+- **Schedules**: Every schedule expression is in UTC. A function on
+  Lambda cannot create or remove schedules.
 
 ## Performance Characteristics
 
@@ -674,9 +808,32 @@ Reference items pass through without a download. See [Fan-out](#fan-out).
 **`start_apply(fn: Reference, items: list[Any], max_concurrent=None) -> Job`**
 Start the work of `apply()` and return at once (see [Jobs](#jobs)).
 
+**`run_later(fn: Reference, /, *args, **kwargs) -> Job`**
+Start one call and return at once (see
+[Later, at a time, and on a schedule](#later-at-a-time-and-on-a-schedule)).
+
+**`run_at(when: datetime | timedelta, fn: Reference, /, *args, **kwargs) -> Job`**
+Start one call at a time, to the second.
+
 **`attach(job_id: str) -> Job`**
-The job with this ID. **`Job.id`**, **`Job.status()`** and
-**`Job.results()`** report on it.
+The job with this ID. **`Job.id`** and **`Job.status()`** report on it.
+**`Job.results()`** waits for a job of `start_apply()`, and
+**`Job.result()`** for a job of one call.
+
+### Schedule Functions
+
+**`schedule(name: str, expression: str, fn: Reference, /, *args, **kwargs)`**
+Run the call on an EventBridge Scheduler expression, in UTC (see
+[Schedules](#schedules)). Raises `ValueError` if the name is in use.
+
+**`reschedule(name: str, expression: str, fn: Reference, /, *args, **kwargs)`**
+Replace the schedule of that name, or create it.
+
+**`unschedule(name: str)`**
+Delete the schedule and its copies.
+
+**`schedules() -> list[str]`**
+The names of the schedules, sorted.
 
 ### Reference Methods
 

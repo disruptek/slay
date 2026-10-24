@@ -5,21 +5,8 @@ once and keeps the outcome in the memory of the process.
 
 import pytest
 import slay
+from functions import fail_odd
 from run_log import logged, runs
-
-
-def fail_odd(x):
-    if x % 2:
-        raise ValueError(str(x))
-    return x
-
-
-@pytest.fixture
-def sleeps(monkeypatch):
-    """The seconds passed to time.sleep, which returns at once"""
-    recorded = []
-    monkeypatch.setattr("time.sleep", recorded.append)
-    return recorded
 
 
 class TestLocalJobs:

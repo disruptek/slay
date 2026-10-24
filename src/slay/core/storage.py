@@ -352,6 +352,46 @@ class _S3Store(_Store):
             raise
         return True
 
+    # A DeleteObjects request names at most this many keys
+    _DELETE_BATCH = 1000
+
+    def copy(self, source: str, target: str) -> None:
+        """Copy an object to another key in the bucket, without a download"""
+        with _storage_errors("copy", source):
+            self.s3.copy_object(
+                Bucket=self.bucket,
+                Key=target,
+                CopySource={"Bucket": self.bucket, "Key": source},
+            )
+
+    def keys(self, prefix: str) -> list[str]:
+        """The keys that start with prefix, from every page of the listing"""
+        found = []
+        with _storage_errors("list", prefix):
+            for page in self.s3.get_paginator("list_objects_v2").paginate(
+                Bucket=self.bucket, Prefix=prefix
+            ):
+                found.extend(entry["Key"] for entry in page.get("Contents", []))
+        return found
+
+    def delete(self, keys: list[str]) -> None:
+        """
+        Delete these keys; a key that does not exist is no error.
+
+        Raises:
+            StorageError: If a request fails, or S3 could not delete a key
+        """
+        for start in range(0, len(keys), self._DELETE_BATCH):
+            batch = keys[start : start + self._DELETE_BATCH]
+            with _storage_errors("delete", batch[0]):
+                response = self.s3.delete_objects(
+                    Bucket=self.bucket,
+                    Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+                )
+            if response.get("Errors"):
+                error = response["Errors"][0]
+                raise StorageError(f"Failed to delete {error['Key']}: {error.get('Message')}")
+
 
 def open_store() -> _Store:
     """

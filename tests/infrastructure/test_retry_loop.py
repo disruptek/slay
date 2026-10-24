@@ -6,13 +6,14 @@ calls the in-process Lambda stand-in, which runs the real handler, so the
 loop, the handler and the wire format run together without AWS.
 """
 
+import datetime as dt
 import json
 import time
-import uuid
 
 import pytest
 import slay
 from botocore.exceptions import ClientError
+from executions import run_execution
 from lambda_stand_in import function_error
 from run_log import logged, runs
 from slay.core.wire import dict_to_ref, encode_call
@@ -21,24 +22,19 @@ from synth import machine_arn
 ARN = machine_arn("slay-retry")
 
 
-def run_loop(sfn, call, waits=(), retry_on=("failure",), timeout=900, index=0):
-    """Start slay-retry with this input and wait for it to end"""
-    document = {
-        "index": index,
-        "call": call,
-        "retry": {"waits": list(waits), "retry_on": list(retry_on), "timeout": timeout},
-        "attempt": 0,
-    }
-    execution = sfn.start_execution(
-        stateMachineArn=ARN, name=uuid.uuid4().hex, input=json.dumps(document)
-    )["executionArn"]
-    deadline = time.monotonic() + 60
-    while True:
-        described = sfn.describe_execution(executionArn=execution)
-        if described["status"] != "RUNNING":
-            return described
-        assert time.monotonic() < deadline, "the execution did not end"
-        time.sleep(0.05)
+def run_loop(
+    sfn, call, waits=(), retry_on=("failure",), timeout=900, index=0, dead_letter=None, **extra
+):
+    """
+    Start slay-retry with this input, the retry settings' dead_letter if
+    given, and the extra fields (at), and wait for it to end. The
+    description holds the executionArn.
+    """
+    retry = {"waits": list(waits), "retry_on": list(retry_on), "timeout": timeout}
+    if dead_letter is not None:
+        retry["dead_letter"] = dead_letter
+    document = {"index": index, "call": call, "retry": retry, "attempt": 0, **extra}
+    return run_execution(sfn, ARN, json.dumps(document))
 
 
 def output_of(described, index=0):
@@ -215,3 +211,86 @@ class TestIndex:
         output = output_of(run_loop(sfn, double_call(log), index=7), index=7)
 
         assert output["status"] == "lambda_error"
+
+
+def timestamp(when):
+    """A UTC time as the input's at: whole seconds, with a Z"""
+    return when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestDelay:
+    """With at, the first attempt waits for that time"""
+
+    def test_first_attempt_waits(self, sfn, stand_in, log, utc):
+        """moto rounds the wait down to whole seconds, hence the second of slack"""
+        when = dt.datetime.now(dt.timezone.utc).replace(microsecond=0) + dt.timedelta(seconds=2)
+        invoked = []
+        stand_in.delay = lambda event: invoked.append(time.time()) or 0.0
+
+        output = output_of(run_loop(sfn, double_call(log), at=timestamp(when)))
+
+        assert output["status"] == "success"
+        assert invoked[0] >= when.timestamp() - 1.0
+
+    def test_past_time_runs_at_once(self, sfn, stand_in, log, utc):
+        when = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)
+        started = time.monotonic()
+
+        output = output_of(run_loop(sfn, double_call(log), at=timestamp(when)))
+
+        assert output["status"] == "success"
+        assert time.monotonic() - started < 5
+
+
+class TestDeadLetters:
+    """With dead_letter true, a last attempt that failed sends a message"""
+
+    def test_raised(self, sfn, stand_in, log, dead_letters):
+        call = double_call(log, fail_times=99)
+
+        described = run_loop(sfn, call, dead_letter=True)
+
+        response = output_of(described)
+        assert response["status"] == "error"
+        assert dead_letters() == [
+            {"execution": described["executionArn"], "call": call, "response": response}
+        ]
+
+    def test_crashed(self, sfn, stand_in, log, dead_letters):
+        """The message's response is the lambda_error report of the output"""
+        stand_in.queue.append(function_error("Runtime.ExitError", "exit status 137"))
+        call = double_call(log)
+
+        described = run_loop(sfn, call, dead_letter=True)
+
+        response = output_of(described)
+        assert response["status"] == "lambda_error"
+        assert dead_letters() == [
+            {"execution": described["executionArn"], "call": call, "response": response}
+        ]
+
+    def test_after_the_last_retry(self, sfn, stand_in, log, dead_letters):
+        """Attempts that are retried send nothing; the last one sends one message"""
+        output_of(run_loop(sfn, double_call(log, fail_times=99), waits=[0, 0], dead_letter=True))
+
+        assert runs(log) == 3
+        (letter,) = dead_letters()
+        assert letter["response"]["error"] == "attempt 3"
+
+    def test_none_for_a_result(self, sfn, stand_in, log, dead_letters):
+        output = output_of(run_loop(sfn, double_call(log), dead_letter=True))
+
+        assert output["status"] == "success"
+        assert dead_letters() == []
+
+    def test_none_for_a_result_after_retries(self, sfn, stand_in, log, dead_letters):
+        output_of(run_loop(sfn, double_call(log, fail_times=1), waits=[0], dead_letter=True))
+
+        assert dead_letters() == []
+
+    @pytest.mark.parametrize("extra", [{}, {"dead_letter": False}], ids=["absent", "false"])
+    def test_none_without_the_flag(self, sfn, stand_in, log, dead_letters, extra):
+        output = output_of(run_loop(sfn, double_call(log, fail_times=99), **extra))
+
+        assert output["status"] == "error"
+        assert dead_letters() == []

@@ -2,6 +2,9 @@
 Pytest configuration and shared fixtures for slay tests.
 """
 
+import os
+import time
+
 import pytest
 
 
@@ -13,6 +16,34 @@ def local_backend():
     slay.set_backend("local")
     yield
     # No cleanup needed
+
+
+@pytest.fixture
+def sleeps(monkeypatch):
+    """The seconds passed to time.sleep, which returns at once"""
+    recorded = []
+    monkeypatch.setattr("time.sleep", recorded.append)
+    return recorded
+
+
+@pytest.fixture
+def time_zone():
+    """
+    A function that sets the local time zone of the process, as a POSIX
+    TZ string (for example "EST5", which is UTC-5), until the test ends
+    """
+    saved = os.environ.get("TZ")
+
+    def set_zone(zone):
+        os.environ["TZ"] = zone
+        time.tzset()
+
+    yield set_zone
+    if saved is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = saved
+    time.tzset()
 
 
 @pytest.fixture
