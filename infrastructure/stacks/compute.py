@@ -2,6 +2,7 @@
 
 import sys
 from aws_cdk import (
+    ArnFormat,
     AssetHashType,
     BundlingOptions,
     CfnOutput,
@@ -10,10 +11,20 @@ from aws_cdk import (
     Size,
     aws_lambda as lambda_,
     aws_iam as iam,
+    aws_stepfunctions as sfn,
 )
 from constructs import Construct
 
 from stacks.bundling import RUNTIME_DIR, LocalBundler
+from stacks.fanout import RESULT_WRITER_V2_FLAG, fanout
+from stacks.retry_loop import retry_loop
+
+# Fixed names: the client builds the ARNs from its region and account
+EXECUTOR_FUNCTION = "slay-executor"
+RETRY_STATE_MACHINE = "slay-retry"
+FANOUT_STATE_MACHINE = "slay-fanout"
+# Every state machine name above starts with this
+STATE_MACHINE_PREFIX = "slay-"
 
 
 def lambda_runtime_for(version_info) -> lambda_.Runtime:
@@ -48,6 +59,10 @@ class ComputeStack(Stack):
     ):
         super().__init__(scope, construct_id, **kwargs)
 
+        # Before any construct is added: the fan-out's ResultWriterV2
+        # renders only with this flag
+        self.node.set_context(RESULT_WRITER_V2_FLAG, True)
+
         # Lambda execution role
         role = iam.Role(
             self,
@@ -62,6 +77,37 @@ class ComputeStack(Stack):
 
         # Grant S3 access for storage bucket
         storage_bucket.grant_read_write(role)
+
+        # Nested calls: the executor may invoke itself and start and watch
+        # executions of slay's state machines. The ARNs come from the fixed
+        # names; references to the resources would make the function, its
+        # role and the state machines depend on each other.
+        def arn(service: str, resource: str, name: str) -> str:
+            return self.format_arn(
+                service=service,
+                resource=resource,
+                resource_name=name,
+                arn_format=ArnFormat.COLON_RESOURCE_NAME,
+            )
+
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["lambda:InvokeFunction"],
+                resources=[arn("lambda", "function", EXECUTOR_FUNCTION)],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["states:StartExecution"],
+                resources=[arn("states", "stateMachine", f"{STATE_MACHINE_PREFIX}*")],
+            )
+        )
+        role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["states:DescribeExecution"],
+                resources=[arn("states", "execution", f"{STATE_MACHINE_PREFIX}*:*")],
+            )
+        )
 
         # The executor runs the deploying interpreter's Python minor version
         runtime = lambda_runtime_for(sys.version_info)
@@ -82,7 +128,7 @@ class ComputeStack(Stack):
         self.executor = lambda_.Function(
             self,
             "Executor",
-            function_name="slay-executor",
+            function_name=EXECUTOR_FUNCTION,
             runtime=runtime,
             handler="handler.execute",
             code=code,
@@ -91,6 +137,8 @@ class ComputeStack(Stack):
             role=role,
             environment={
                 "SLAY_STORAGE_BUCKET": storage_bucket.bucket_name,
+                # Nested run() and apply() go to AWS, not to this process
+                "SLAY_BACKEND": "lambda",
             },
             # Ephemeral storage for large intermediate results
             ephemeral_storage_size=Size.gibibytes(10),
@@ -98,3 +146,29 @@ class ComputeStack(Stack):
         )
 
         CfnOutput(self, "ExecutorFunction", value=self.executor.function_name)
+
+        # Retried calls: a loop that the execution input controls
+        self.retry_machine = sfn.StateMachine(
+            self,
+            "RetryMachine",
+            state_machine_name=RETRY_STATE_MACHINE,
+            state_machine_type=sfn.StateMachineType.STANDARD,
+            definition_body=sfn.DefinitionBody.from_chainable(
+                retry_loop(self, "RetryLoop", self.executor)
+            ),
+        )
+
+        CfnOutput(self, "RetryStateMachine", value=self.retry_machine.state_machine_name)
+
+        # Many calls: a Distributed Map whose children run the same loop
+        self.fanout_machine = sfn.StateMachine(
+            self,
+            "FanoutMachine",
+            state_machine_name=FANOUT_STATE_MACHINE,
+            state_machine_type=sfn.StateMachineType.STANDARD,
+            definition_body=sfn.DefinitionBody.from_chainable(
+                fanout(self, "Fanout", self.executor, storage_bucket)
+            ),
+        )
+
+        CfnOutput(self, "FanoutStateMachine", value=self.fanout_machine.state_machine_name)

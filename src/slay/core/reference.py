@@ -127,7 +127,8 @@ class Reference:
             Reference to the result
 
         Raises:
-            RemoteExecutionError: If execution fails
+            Exception: The exception the function raised, as run() raises it
+            RemoteExecutionError: If the backend fails outside the function
 
         Example:
             >>> fn = slay.put(lambda x: x + 1)
@@ -172,6 +173,13 @@ class Reference:
             f"Reference(hash={self.hash[:8]}..., size={self.size}, "
             f"tier={self.storage_tier})"
         )
+
+
+def as_reference(value: Any) -> Reference:
+    """A Reference passes through as it is; any other value is stored"""
+    if isinstance(value, Reference):
+        return value
+    return create_reference(value)
 
 
 def create_reference(obj: Any) -> Reference:

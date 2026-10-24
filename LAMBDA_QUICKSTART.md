@@ -137,10 +137,10 @@ def expensive_computation(x):
 fn_ref = slay.put(expensive_computation)
 cached = slay.add_caching(fn_ref)
 
-# First call: Computes and caches
+# First call: runs on Lambda, then writes the entry to the storage bucket
 result1 = cached(5).get()
 
-# Second call: answered from the cache if the same warm container runs it
+# Second call: the client reads the entry and makes no Lambda call
 result2 = cached(5).get()
 ```
 

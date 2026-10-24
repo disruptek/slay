@@ -170,11 +170,18 @@ items = list(range(10000))
 results = slay.get_many(slay.apply(slay.put(process_item), items))
 
 # How it works:
-# - slay creates 10,000 Lambda invocations (automatically)
-# - Each invocation processes one item
-# - Results collected and returned in order
-# - All happens concurrently (limited by AWS account concurrency, typically ~1000)
+# - slay writes the 10,000 calls to the storage bucket and starts one
+#   execution of the slay-fanout state machine
+# - Its Distributed Map runs one child execution, and one Lambda
+#   invocation, per item
+# - Results are collected and returned in order
+# - Concurrency is limited by the account's Lambda concurrency (typically
+#   ~1000), or by max_concurrent:
+results = slay.get_many(slay.apply(slay.put(process_item), items, max_concurrent=100))
 ```
+
+SLAY_STORAGE_BUCKET must name the stack's S3 bucket. See the README
+sections "Fan-out" and "Jobs".
 
 ## Function Composition with Lambda
 
@@ -199,9 +206,8 @@ cached = slay.add_caching(resilient)
 # First call: Makes API request, retries on failure, caches result
 result = cached("https://api.example.com/data").get()
 
-# Second call: invokes Lambda again. The cache lives in the memory of the
-# process that runs the function, so only a warm container that ran the
-# first call answers from the cache.
+# Second call: the client reads the cache entry from the storage bucket
+# and makes no Lambda call
 result2 = cached("https://api.example.com/data").get()
 ```
 
@@ -228,17 +234,21 @@ slay.set_backend('lambda')
 
 try:
     result = slay.put(my_function)(data).get()
+except ValueError as e:               # the function's own exception type
+    remote = e.__cause__              # slay.RemoteExecutionError
+    print("Remote traceback:", remote.remote_traceback)
+    print("Remote logs:", remote.remote_logs)
 except slay.RemoteExecutionError as e:
-    print("Error:", e.message)
-    print("Remote traceback:", e.remote_traceback)
-    print("Remote logs:", e.remote_logs)
+    # The Lambda failed outside the function, for example on a timeout
+    print("Error:", e.error_type, e.message)
 ```
 
-The error includes:
-- Full remote stack trace
-- All stdout/stderr output
-- Execution logs
-- Timing information
+The `RemoteExecutionError` holds:
+- The remote traceback text (`remote_traceback`)
+- The stdout and stderr of the call (`remote_logs`)
+- The exception's type name, or the Lambda `errorType` (`error_type`)
+
+The README section "Errors" lists every case.
 
 ### Check S3 Storage
 
@@ -271,15 +281,15 @@ Example: Process 10,000 items, each takes 5 seconds, 512MB memory
 
 ```
 Compute cost:
-  10,000 invocations × 0.5GB × 5 sec × $0.0000166667 = $4.17
+  10,000 invocations × 0.5GB × 5 sec × $0.0000166667 = $0.42
 
-Orchestration cost:
-  ~$0.25 (very small)
+Orchestration cost (Step Functions, Standard):
+  10,000 items × about 4 state transitions × $0.000025 = $1.00
 
 Storage cost (1GB data):
   ~$0.023/month (negligible for short-term storage)
 
-Total: ~$4.42 for 10,000 parallel executions
+Total: ~$1.42 for 10,000 parallel executions
 ```
 
 ## Troubleshooting

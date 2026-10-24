@@ -16,10 +16,34 @@ import tempfile
 import slay
 
 
+def flaky(counter_path: str):
+    """
+    A flaky operation: the first two attempts fail.
+
+    Each attempt runs a fresh copy of the function (on Lambda, in a fresh
+    invocation), so the attempts are counted in a file, not in memory.
+    """
+
+    def flaky_operation(x: int) -> int:
+        with open(counter_path, "a") as counter:
+            counter.write("attempt\n")
+        with open(counter_path) as counter:
+            attempt = len(counter.readlines())
+        if attempt < 3:
+            raise Exception("Simulated failure")
+        return x * 2
+
+    return flaky_operation
+
+
 def main():
-    # For local testing, use temp directory for storage
-    tmpdir = tempfile.mkdtemp()
-    os.environ["SLAY_STORAGE_BUCKET"] = tmpdir
+    # For local testing, use a temporary directory for storage
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.environ["SLAY_STORAGE_BUCKET"] = tmpdir
+        run_examples(tmpdir)
+
+
+def run_examples(tmpdir: str):
     print("=" * 60)
     print("Function Composition: Retry & Caching")
     print("=" * 60)
@@ -29,16 +53,7 @@ def main():
     print("Example 1: Resilient Execution with Retry")
     print("-" * 60)
 
-    attempts = []
-
-    def flaky_operation(x: int) -> int:
-        """Simulates a flaky operation: the first two attempts of a call fail."""
-        attempts.append(x)
-        if len(attempts) < 3:
-            raise Exception("Simulated failure")
-        return x * 2
-
-    fn = slay.put(flaky_operation)
+    fn = slay.put(flaky(os.path.join(tmpdir, "example-1.count")))
     resilient_fn = slay.add_retry(fn, attempts=5, backoff=0.1)
     print(f"fn = slay.put(flaky_operation)")
     print(f"resilient_fn = slay.add_retry(fn, attempts=5, backoff=0.1)")
@@ -82,7 +97,7 @@ def main():
     print("Example 3: Composing Retry & Caching")
     print("-" * 60)
 
-    fn = slay.put(flaky_operation)
+    fn = slay.put(flaky(os.path.join(tmpdir, "example-3.count")))
     resilient_fn = slay.add_retry(fn, attempts=5, backoff=0.1)
     resilient_cached_fn = slay.add_caching(resilient_fn)
     print(f"fn = slay.put(flaky_operation)")
@@ -125,10 +140,6 @@ def main():
     print("=" * 60)
     print("✅ Function composition examples completed successfully!")
     print("=" * 60)
-    
-    # Cleanup
-    import shutil
-    shutil.rmtree(tmpdir)
 
 
 if __name__ == "__main__":

@@ -97,7 +97,17 @@ result = result_ref.get()
 fn = slay.put(my_function)
 result_refs = slay.apply(fn, items)
 results = slay.get_many(result_refs)
+
+# At most 100 calls at once
+result_refs = slay.apply(fn, items, max_concurrent=100)
+
+# The same work as a job that outlives the client
+job = slay.start_apply(fn, items)
+result_refs = slay.attach(job.id).results()
 ```
+On Lambda, `apply()` and `start_apply()` run one Step Functions execution
+with a Distributed Map. The README sections "Fan-out" and "Jobs" have the
+details.
 
 ### Function Composition
 ```python
@@ -112,6 +122,12 @@ resilient_fn = slay.add_retry(cached_fn, attempts=5)
 result_ref = resilient_fn(arg)
 result = result_ref.get()
 ```
+`add_retry` calls the function again when an attempt fails. On Lambda, a
+Step Functions loop runs the attempts, so it can also retry a timeout or
+a crash. `add_caching` stores results in the storage bucket, where every
+client and Lambda shares them. A hit makes no backend call. `add_cache_only` reads
+the same entries and raises `CacheMiss` on a miss. The README section
+"Caching" has the details.
 
 ## Reference Properties
 
@@ -135,6 +151,22 @@ assert twelve.get() == 12
 ```
 A Reference inside a list, dict or other container is not resolved. The
 function receives the Reference object and can call `.get()` itself.
+
+### Errors
+A remote call raises the function's own exception type, as a local call
+does. On Lambda, the exception's `__cause__` is a `RemoteExecutionError`
+with the remote traceback, the captured output and the type name:
+```python
+fn = slay.put(lambda text: int(text))
+try:
+    fn("not a number")
+except ValueError as e:
+    print(e.__cause__.remote_traceback)
+```
+`apply()` raises the exception of the lowest failing item index. The caller
+gets `RemoteExecutionError` itself only when the exception cannot cross the
+wire, or when the Lambda fails outside the function. The README section
+"Errors" lists every case.
 
 ### Content-Addressed Equality
 References with identical content are equal:
@@ -189,7 +221,8 @@ The old API (`run_remotely`, `run_parallel`) is completely removed in v2.0:
 The architecture supports future additions:
 - Async execution: `await fn(arg)`
 - Streaming: `fn.stream(items)` returns async iterator
-- Job tracking: `job = fn.spawn(arg); job.status(); job.result()`
+- Job tracking for single calls: `job = fn.spawn(arg); job.status();
+  job.result()` (`start_apply()` covers many items)
 - Custom executors: Pluggable execution strategies
 
 All without changing the core `put/get/run/apply` primitives.

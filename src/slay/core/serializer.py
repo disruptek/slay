@@ -8,10 +8,13 @@ Supports:
 - Dill for everything else (functions, classes, custom objects)
 """
 
+import importlib
+import io
 import json
 import sys
 import dill
 from dataclasses import dataclass, asdict
+from types import ModuleType
 from typing import Any, Optional
 
 from slay.exceptions import SerializationError
@@ -59,7 +62,7 @@ def serialize(obj: Any) -> bytes:
         if format_str == "numpy":
             return _serialize_numpy(obj)
         # dill handles functions, closures, classes, etc.
-        return dill.dumps(obj, recurse=True)
+        return _dill_dumps(obj)
     except Exception as e:
         raise SerializationError(f"Failed to serialize {type(obj).__name__}: {e}") from e
 
@@ -129,6 +132,29 @@ def get_type_info(obj: Any) -> TypeInfo:
         module=obj_type.__module__,
         metadata={"python": _python_version()} if format_str == "dill" else {},
     )
+
+
+class _Pickler(dill.Pickler):
+    """
+    dill's Pickler, except that it stores slay and its submodules by name.
+
+    dill stores a module by value when its file is outside the standard
+    library and site-packages: slay in src/ or in the Lambda's /var/task.
+    slay's module state (a thread-local, for one) does not pickle, and
+    every process that loads a slay value has slay to import.
+    """
+
+    def reducer_override(self, obj: Any) -> Any:
+        if isinstance(obj, ModuleType) and obj.__name__.split(".")[0] == "slay":
+            return importlib.import_module, (obj.__name__,)
+        return NotImplemented
+
+
+def _dill_dumps(obj: Any) -> bytes:
+    """dill.dumps(obj, recurse=True), through _Pickler"""
+    buffer = io.BytesIO()
+    _Pickler(buffer, dill.settings["protocol"], recurse=True).dump(obj)
+    return buffer.getvalue()
 
 
 def _python_version() -> str:

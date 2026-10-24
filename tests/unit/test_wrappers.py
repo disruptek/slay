@@ -4,129 +4,151 @@ Unit tests for function composition wrappers.
 
 import pytest
 import slay
+from run_log import logged, runs
 from slay import add_retry, add_caching, create_reference
 
 
+@pytest.fixture
+def sleeps(monkeypatch):
+    """The seconds passed to time.sleep, which returns at once"""
+    recorded = []
+    monkeypatch.setattr("time.sleep", recorded.append)
+    return recorded
+
+
 class TestAddRetry:
-    """Tests for add_retry wrapper"""
+    """add_retry on the local backend: an in-process loop"""
 
-    def test_retry_succeeds_immediately(self, local_backend, clear_cache, mock_s3_bucket, capsys):
-        """Retry succeeds on first attempt without retrying"""
-
-        def always_works(x):
-            return x * 2
-
-        func_ref = create_reference(always_works)
-        retried = add_retry(func_ref, attempts=3)
+    def test_retry_succeeds_immediately(self, local_backend, mock_s3_bucket, tmp_path, sleeps):
+        """A first attempt that returns is the only attempt"""
+        log = tmp_path / "runs.log"
+        retried = add_retry(create_reference(logged(log)), attempts=3)
 
         assert retried(5).get() == 10
-        assert "[retry]" not in capsys.readouterr().out
+        assert runs(log) == 1
+        assert sleeps == []
 
-    def test_retry_with_eventual_success(self, local_backend, clear_cache, mock_s3_bucket, capsys):
-        """Retry succeeds after two failed attempts"""
-        attempts = []
-
-        def fails_twice(x):
-            attempts.append(x)
-            if len(attempts) < 3:
-                raise Exception("Simulated failure")
-            return x * 2
-
-        func_ref = create_reference(fails_twice)
-        retried = add_retry(func_ref, attempts=5, backoff=0.01)
+    def test_retry_with_eventual_success(self, local_backend, mock_s3_bucket, tmp_path, sleeps):
+        """Failures wait backoff * 2 ** n seconds, then run again"""
+        log = tmp_path / "runs.log"
+        retried = add_retry(create_reference(logged(log, fail_times=2)), attempts=5, backoff=0.5)
 
         assert retried(5).get() == 10
-        out = capsys.readouterr().out
-        assert "Attempt 1 failed" in out
-        assert "Attempt 2 failed" in out
-        assert "Attempt 3 failed" not in out
+        assert runs(log) == 3
+        assert sleeps == [0.5, 1.0]
 
-    def test_retry_gives_up_after_attempts(self, local_backend, clear_cache, mock_s3_bucket):
-        """Retry gives up after max attempts"""
+    def test_retry_gives_up_after_attempts(self, local_backend, mock_s3_bucket, tmp_path, sleeps):
+        """After the last attempt, its exception propagates unchanged"""
+        log = tmp_path / "runs.log"
+        retried = add_retry(create_reference(logged(log, fail_times=99)), attempts=2)
 
-        def always_fails(x):
-            raise Exception("Always fails")
-
-        func_ref = create_reference(always_fails)
-        retried = add_retry(func_ref, attempts=2, backoff=0.01)
-
-        with pytest.raises(slay.RemoteExecutionError, match="Always fails"):
+        with pytest.raises(ValueError, match="attempt 2") as excinfo:
             retried(5)
 
+        assert type(excinfo.value) is ValueError
+        assert runs(log) == 2
+        assert sleeps == [1.0]
 
-class TestAddCaching:
-    """Tests for add_caching wrapper"""
+    def test_no_retry_without_retry_on_failure(
+        self, local_backend, mock_s3_bucket, tmp_path, sleeps
+    ):
+        """The local loop retries only failures"""
+        log = tmp_path / "runs.log"
+        retried = add_retry(
+            create_reference(logged(log, fail_times=1)),
+            retry_on_failure=False,
+            retry_on_timeout=True,
+            retry_on_crash=True,
+        )
 
-    def test_caching_same_arguments(self, local_backend, clear_cache, mock_s3_bucket, capsys):
-        """Same arguments return the cached result without running the function"""
+        with pytest.raises(ValueError, match="attempt 1"):
+            retried(5)
+        assert runs(log) == 1
 
-        def expensive(x):
-            return x * 2
+    def test_timeout_does_not_apply_locally(self, local_backend, mock_s3_bucket, tmp_path):
+        """The local loop cannot interrupt an attempt, so timeout is ignored"""
+        log = tmp_path / "runs.log"
+        retried = add_retry(create_reference(logged(log)), timeout=1)
 
-        func_ref = create_reference(expensive)
-        cached = add_caching(func_ref)
+        assert retried(5).get() == 10
 
-        assert cached(5).get() == 10
-        assert "[cache] Miss" in capsys.readouterr().out
+    def test_add_retry_does_not_fetch_the_function(self, local_backend, mock_s3_bucket):
+        """Wrapping a function that cannot load here does not raise"""
+        from slay.core.reference import Reference
+        from slay.core.serializer import TypeInfo
+        from slay.exceptions import SerializationError
 
-        assert cached(5).get() == 10
-        assert "[cache] Hit" in capsys.readouterr().out
+        real = slay.put(lambda x: x)
+        foreign = Reference(
+            hash=real.hash,
+            size=real.size,
+            storage_tier=real.storage_tier,
+            type_info=TypeInfo(
+                format="dill", type_name="function", module="__main__",
+                metadata={"python": "3.0"},
+            ),
+            inline_data=real.inline_data,
+        )
 
-    def test_caching_different_arguments(self, local_backend, clear_cache, mock_s3_bucket, capsys):
-        """Different arguments cause new execution"""
+        retried = add_retry(foreign, attempts=1)
 
-        def expensive(x):
-            return x * 2
+        with pytest.raises(SerializationError, match="Python 3.0"):
+            retried(1)
 
-        func_ref = create_reference(expensive)
-        cached = add_caching(func_ref)
+    def test_wrapper_value_is_callable(self, local_backend, mock_s3_bucket, tmp_path, sleeps):
+        """wrapper.get() runs the retried call in this process"""
+        log = tmp_path / "runs.log"
+        retried = add_retry(create_reference(logged(log, fail_times=1)), backoff=0)
 
-        assert cached(5).get() == 10
-        capsys.readouterr()
+        assert retried.get()(5) == 10
+        assert runs(log) == 2
 
-        assert cached(7).get() == 14
-        assert "[cache] Miss" in capsys.readouterr().out
-
-    def test_cache_clear(self, local_backend, clear_cache, mock_s3_bucket):
-        """Can clear cache"""
-
-        def expensive(x):
-            return x * 2
-
-        func_ref = create_reference(expensive)
-        cached = add_caching(func_ref)
-
-        assert cached(5).get() == 10
-
-        # Check cache has entries
-        stats = slay.wrappers.cache_stats()
-        assert stats["entries"] > 0
-
-        # Clear cache
-        slay.wrappers.clear_cache()
-
-        # Cache should be empty
-        stats_after = slay.wrappers.cache_stats()
-        assert stats_after["entries"] == 0
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"attempts": 0},
+            {"backoff": -1.0},
+            {"timeout": 0},
+            {"timeout": 1.5},
+        ],
+    )
+    def test_invalid_options(self, local_backend, options):
+        with pytest.raises(ValueError):
+            add_retry(slay.put(lambda x: x), **options)
 
 
 class TestComposedWrappers:
     """Tests for combining multiple wrappers"""
 
-    def test_retry_then_cache(self, local_backend, clear_cache, mock_s3_bucket, capsys):
-        """Combine retry and caching"""
+    @staticmethod
+    def _logged_double(log):
+        path = str(log)
 
-        def flaky(x):
+        def double(x):
+            with open(path, "a") as f:
+                f.write(f"{x}\n")
             return x * 2
 
-        func_ref = create_reference(flaky)
-        retried = add_retry(func_ref, attempts=3, backoff=0.01)
+        return double
+
+    def test_retry_then_cache(self, local_backend, mock_s3_bucket, tmp_path):
+        """A cached retried function runs once and writes a shared entry"""
+        log = tmp_path / "runs.log"
+        retried = add_retry(create_reference(self._logged_double(log)), attempts=3, backoff=0.01)
         cached = add_caching(retried)
 
-        # First call: retry wrapping works, then caches
         assert cached(5).get() == 10
-        capsys.readouterr()
+        assert cached(5).get() == 10
+        assert log.read_text().split() == ["5"]
+        assert list((mock_s3_bucket / "cache").rglob("*.json"))
 
-        # Second call: from cache
-        assert cached(5).get() == 10
-        assert "[cache] Hit" in capsys.readouterr().out
+    def test_cache_then_retry(self, local_backend, mock_s3_bucket, tmp_path):
+        """A retried cached function runs once and writes a shared entry"""
+        log = tmp_path / "runs.log"
+        cached = add_caching(create_reference(self._logged_double(log)))
+        resilient = add_retry(cached, attempts=3, backoff=0.01)
+
+        assert resilient(5).get() == 10
+        assert resilient(5).get() == 10
+        assert log.read_text().split() == ["5"]
+        assert list((mock_s3_bucket / "cache").rglob("*.json"))

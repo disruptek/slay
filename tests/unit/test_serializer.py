@@ -5,6 +5,8 @@ Unit tests for serialization system.
 import pytest
 import json
 import sys
+
+import slay
 from slay.core.serializer import (
     TypeInfo,
     serialize,
@@ -256,3 +258,29 @@ class TestPythonVersion:
         data, info = self._function_bytes_and_info(None)
 
         assert deserialize(data, info)(2, 3) == 5
+
+
+class TestSlayModules:
+    """dill stores slay and its submodules by name, not by value"""
+
+    def test_function_that_names_slay_round_trips(self):
+        """slay's module state does not pickle, so by value this fails"""
+
+        def describe(x):
+            return f"{slay.__name__}:{x}"
+
+        assert _roundtrip(describe)(1) == "slay:1"
+
+    def test_loaded_function_uses_the_imported_module(self):
+        def module():
+            return slay
+
+        assert _roundtrip(module)() is sys.modules["slay"]
+
+    def test_submodule_by_name(self):
+        import slay.core.storage as storage
+
+        def module():
+            return storage
+
+        assert _roundtrip(module)() is sys.modules["slay.core.storage"]

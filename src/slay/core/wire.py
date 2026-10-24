@@ -1,9 +1,10 @@
 """
 JSON wire format for references and calls.
 
-LambdaBackend encodes each call with encode_call(). runtime/handler.py
-decodes it with decode_call() and sends its result back as ref_to_dict().
-Both sides import this module, so the format has one definition.
+LambdaBackend encodes each call with encode_call(), or a fan-out's items
+with encode_arguments(). runtime/handler.py decodes a call with
+decode_call() and sends its result back as ref_to_dict(). Both sides
+import this module, so the format has one definition.
 """
 
 from typing import Any
@@ -37,15 +38,19 @@ def dict_to_ref(data: dict[str, Any]) -> Reference:
     )
 
 
+def encode_arguments(args: list[Reference], kwargs: dict[str, Reference]) -> dict[str, Any]:
+    """Encode the arguments of one call: an item of a fan-out's items file"""
+    return {
+        "args_refs": [ref_to_dict(ref) for ref in args],
+        "kwargs_refs": {name: ref_to_dict(ref) for name, ref in kwargs.items()},
+    }
+
+
 def encode_call(
     func_ref: Reference, args: list[Reference], kwargs: dict[str, Reference]
 ) -> dict[str, Any]:
     """Encode one function call as a JSON-serializable event"""
-    return {
-        "func_ref": ref_to_dict(func_ref),
-        "args_refs": [ref_to_dict(ref) for ref in args],
-        "kwargs_refs": {name: ref_to_dict(ref) for name, ref in kwargs.items()},
-    }
+    return {"func_ref": ref_to_dict(func_ref), **encode_arguments(args, kwargs)}
 
 
 def decode_call(

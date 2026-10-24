@@ -87,6 +87,14 @@ versions. A dill value without this field (written before the field existed)
 loads as before. JSON, Parquet and NumPy values do not depend on the Python
 version and carry no such field.
 
+**slay's own modules:** dill stores a module by value when its file is
+outside the standard library and site-packages, and slay's module state
+(a thread-local, for one) does not pickle. In the Lambda, slay sits in
+`/var/task`; in a development checkout, in `src/`. `serialize` therefore
+uses a dill Pickler that stores `slay` and its submodules by name, so a
+function that names the `slay` module serializes there too. Loading it
+imports slay, which every executor has.
+
 #### 3. Multi-Tier Storage System (`core/storage.py`)
 
 Automatic tier selection based on data size and context.
@@ -107,6 +115,12 @@ Data Size        Tier        Storage Medium
   storing such a value raises `StorageError`, which names the variable
 - S3 operations are abstracted and can fall back to local filesystem (for testing)
 - All data is sharded by first 2 chars of hash for S3 performance
+- Keys: `refs/<h[:2]>/<h>.bin` for values, `cache/<k[:2]>/<k>.json` for
+  result cache entries (see Function Composition)
+- `write_object`, `read_object` and `object_exists` work on any key, in S3
+  or in the directory. `read_object` returns None for a missing key. S3
+  reports a missing key as 404 only to a caller with `s3:ListBucket`;
+  without that right, the 403 raises `StorageError`
 - Metadata stored alongside data
 - Content-addressed means automatic deduplication
 
@@ -142,9 +156,18 @@ Global state management and backend selection.
 ```python
 class ExecutorBackend(ABC):
   # args: list[Reference], kwargs: dict[str, Reference]
-  def execute(func_ref, args, kwargs) -> Reference
+  # retry: a Retried policy (see Function Composition), or None
+  # Raises the function's own exception (see Error Handling below)
+  def execute(func_ref, args, kwargs, retry=None) -> Reference
   # args_list: list of (args, kwargs) pairs shaped as above
-  def execute_many(func_ref, args_list) -> List[Reference]
+  # max_concurrent: the most calls at once, or None for the backend's own
+  # Raises the error of the lowest failing index
+  def execute_many(func_ref, args_list, retry=None, max_concurrent=None) -> List[Reference]
+
+  # Jobs: execute_many in two steps, so a client can leave and come back
+  def start_many(func_ref, args_list, retry=None, max_concurrent=None) -> str  # job ID
+  def job_status(job_id) -> str     # "RUNNING", "SUCCEEDED", "FAILED", ...
+  def job_results(job_id) -> List[Reference]  # waits; raises as execute_many
   
   @property
   def name() -> str               # "local", "lambda", etc
@@ -158,12 +181,33 @@ class ExecutorBackend(ABC):
 - No parallelism (sequential)
 - Unlimited execution time
 - Used for development/testing
+- A function's exception propagates unchanged; `execute_many` stops at the
+  first failure
+- With `retry`, an in-process loop runs each call. It sleeps
+  `backoff * 2 ** n` seconds between attempts and retries only failures:
+  it cannot interrupt an attempt, so `timeout` does not apply
+- `max_concurrent` does not apply. `start_many` runs the items before it
+  returns and keeps the results, or the error, in a dict in memory under
+  a new job ID. `job_status` of a known ID is `"SUCCEEDED"`; `job_status`
+  and `job_results` of an unknown ID raise `ValueError`
 
 **Lambda Backend (`backends/lambda_.py`):**
 - Invokes AWS Lambda function
-- ThreadPoolExecutor for parallel invocations
 - 15-minute timeout per execution
 - 1000+ concurrent executions (account dependent)
+- Re-raises the function's exception (see Error Handling below);
+  `execute_many` waits for every item, then raises the error of the lowest
+  failing index
+- `execute`: without `retry`, invokes the Lambda directly. With `retry`,
+  starts an execution of the `slay-retry` state machine (see section 10)
+  and polls `DescribeExecution` until it ends
+- `execute_many` is `job_results(start_many(...))`. `start_many` writes
+  the calls to the bucket and starts an execution of `slay-fanout` (see
+  section 11); the job ID is the execution ARN. `job_results` polls the
+  execution, then reads the results the Map wrote
+- State machine ARNs come from the region of the Step Functions client
+  and the account from `sts:GetCallerIdentity`, looked up once per
+  backend
 
 **Design Notes:**
 - Backends are swappable - easy to add Fargate, EC2, Kubernetes, etc.
@@ -188,7 +232,9 @@ results = slay.get_many(slay.apply(fn, items))
 **Implementation:**
 1. Create a reference for each argument that is not a Reference already
 2. Get backend (auto-detected or explicit)
-3. Call backend.execute(func_ref, args_refs, kwargs_refs)
+3. Dispatch with `slay.wrappers.call(func_ref, args_refs, kwargs_refs,
+   backend)`: a wrapper runs its policy (see Function Composition), and a
+   plain function goes to `backend.execute`
 4. Return the result Reference; the caller fetches it with `.get()`
 
 Top-level Reference arguments pass through to the backend unchanged, and the
@@ -200,8 +246,11 @@ download. A Reference inside a container is not resolved.
 Layer behaviors without modifying original function.
 
 **Current Wrappers:**
-- `add_retry()`: Automatic retry with exponential backoff
-- `add_caching()`: Result memoization
+- `add_retry()`: Retry with exponential backoff; on Lambda, timeouts and
+  crashes too
+- `add_caching()`: A result cache in the storage bucket, shared by every
+  client and Lambda
+- `add_cache_only()`: Reads that cache; a miss raises `CacheMiss`
 
 **Design Pattern:**
 ```python
@@ -214,18 +263,62 @@ cached = add_caching(retried)
 ```
 
 **Wrapper Implementation:**
-1. Get original function via `.data` property
-2. Create wrapper function with new behavior
-3. Return new reference to wrapper
-4. Chain as needed
 
-**Memoization Cache:**
-```
-Key: hash(function_ref) + ":" + hash(args) + ":" + hash(kwargs)
-Value: Result object
+Each wrapper returns a Reference to a small policy object, a frozen
+dataclass in `slay.wrappers`. Building it does not fetch the inner
+function.
 
-Same function + same arguments = cache hit
+- `Cached` (from `add_caching` and `add_cache_only`) holds the inner
+  function's Reference, the `version`, and whether a miss is an error.
+- `Retried` (from `add_retry`) holds the inner function's Reference,
+  `attempts`, `backoff`, the three `retry_on_*` flags and `timeout`.
+  `Retried.call` runs `backend.execute(inner, args, kwargs, retry=self)`,
+  and `Retried.call_many` runs `backend.execute_many(..., retry=self)`.
+  The backend decides how to retry.
+
+1. The wrapper's Reference keeps the policy in its local cache
+   (`_set_cached`), so the client never fetches it. The policy is stored
+   like any other value: it pickles the inner Reference, about 400 bytes
+   of overhead included, so a policy of 1 KB or more goes to the bucket.
+2. `call(func_ref, args, kwargs, backend)` in `slay.wrappers` dispatches
+   one call. It recognizes a wrapper by `type_info.module ==
+   "slay.wrappers"`, without fetching it, and runs `policy.call(args,
+   kwargs, backend)`. A plain function goes to `backend.execute`.
+   `call_many` does the same for `apply()`, through `policy.call_many` or
+   `backend.execute_many`.
+3. `run()` and `apply()` dispatch with the current backend.
+   `LocalBackend.execute` dispatches a wrapper with itself, and the Lambda
+   handler runs every call through `LocalBackend`. A wrapper that reaches
+   an executor therefore applies inside that executor.
+4. Calling the policy object itself (`wrapper.get()(x)`) runs the call in
+   the calling process, through `LocalBackend`.
+
+When `inner` is itself a wrapper, the backend sends that wrapper to the
+executor. In `add_retry(add_caching(fn))`, each attempt therefore reads
+and writes the cache inside the executor.
+
+**Shared Result Cache:**
 ```
+Key:   sha256(JSON of {function: inner hash,
+                       args: [argument hashes],
+                       kwargs: {name: argument hash},
+                       version: version})
+Entry: cache/<k[:2]>/<k>.json = ref_to_dict(result Reference)
+```
+
+- The arguments are References before dispatch, so the key needs only
+  their hashes: no serialization, no upload.
+- A hit returns the stored Reference. If its tier is `s3`,
+  `object_exists` checks the result object first, because the lifecycle
+  rule deletes objects after 90 days. A missing object is a miss.
+- On a miss, `Cached.call` runs `call(inner, ...)` with the same backend,
+  then writes the entry. A call that raises writes no entry. Two clients
+  that miss at the same time both run the call; the last write wins.
+- `Cached.call_many` looks up all keys in parallel, runs the distinct
+  missing keys through one `call_many(inner, ...)`, writes their entries,
+  and returns the results in item order.
+- Cache-only raises `CacheMiss` before anything runs; in `call_many`, for
+  the lowest missing index.
 
 #### 8. Lambda Runtime (`runtime/handler.py`)
 
@@ -235,15 +328,61 @@ Code that runs inside AWS Lambda.
 1. Receive event with serialized function and arguments
 2. Fetch data from S3 via references
 3. Deserialize using type information
-4. Execute function
+4. Execute function (through `LocalBackend`, which applies wrappers)
 5. Serialize result
 6. Store in S3
 7. Return result reference
 
+The handler keeps the last 64 KB of the captured output, of the
+traceback text and of `error` (the message). The response of a retried
+call passes through a Step Functions state, which holds at most 256 KB.
+
 **Error Handling:**
-- Capture stdout/stderr
-- Include full traceback
-- Store everything for debugging
+
+The goal is that `except` clauses work as they do for a local call. When
+the function raises, the handler returns:
+
+```
+{
+  status: "error",
+  error: str(exception),
+  error_type: type(exception).__name__,
+  traceback: traceback text, including any chained exceptions,
+  exception_ref: Reference to the exception (wire dict), or None,
+  logs: captured stdout and stderr
+}
+```
+
+- The handler stores the exception with `create_reference`. If that
+  fails (dill cannot pickle an attribute, or storage fails),
+  `exception_ref` is None.
+- `LambdaBackend` loads the exception and raises it from a
+  `RemoteExecutionError` that holds `error`, `error_type`, `traceback`
+  and `logs`. The caller catches the original type and reads the remote
+  details from `__cause__`.
+- dill keeps the exception's arguments and attributes, but not
+  `__traceback__`, `__cause__` or `__context__`. Setting `__cause__` on
+  the client therefore loses nothing; the traceback text records the
+  remote chain.
+- dill rebuilds an exception as pickle does: it calls the class with
+  `args`, then restores `__dict__`. An `__init__` whose parameters differ
+  from `args` can change the message or fail the load, unless the class
+  defines `__reduce__`. `RemoteExecutionError` defines one for this reason.
+- If `exception_ref` is None, cannot be loaded, or does not hold an
+  exception, the caller gets the `RemoteExecutionError` itself.
+- slay errors raised in the handler (a `SerializationError` for a Python
+  version mismatch, a `StorageError`) take the same path, so they reach the
+  caller with their own type.
+- `RemoteExecutionError` survives pickling with its message and
+  attributes, so a nested call's error can cross the wire too.
+
+When the Lambda fails outside the handler (timeout, out of memory, runtime
+crash, import error), the invoke response carries `FunctionError`, and the
+payload holds `errorType`, `errorMessage` and, for a Python error,
+`stackTrace`. `LambdaBackend` checks `FunctionError` before it reads the
+payload as a handler response. It raises a `RemoteExecutionError` whose
+`error_type` is `errorType`, whose `message` is `errorMessage`, and whose
+`remote_traceback` is the joined `stackTrace`.
 
 **Packaging:** `cdk deploy` builds the Lambda code on the deploying machine,
 without Docker. The bundle holds `runtime/handler.py`, a copy of `src/slay`,
@@ -257,18 +396,159 @@ CDK-based infrastructure deployment.
 
 **Stacks:**
 - **StorageStack**: S3 bucket + DynamoDB (optional)
-- **ComputeStack**: Lambda function with IAM role
+- **ComputeStack**: Lambda function with IAM role, and the `slay-retry`
+  and `slay-fanout` state machines
 
 **Design:**
 - Single Lambda function for all executions
 - The Lambda Python runtime is the minor version of the Python that runs
   `cdk deploy`, because dill values load only under the version that wrote
   them. Deploying with a version that Lambda does not offer fails at synth.
-- Stack outputs: `StorageBucket` (bucket name) and `ExecutorFunction`
-  (function name)
+- Stack outputs: `StorageBucket` (bucket name), `ExecutorFunction`
+  (function name), `RetryStateMachine` and `FanoutStateMachine` (state
+  machine names)
+- Nested calls: the executor's environment sets `SLAY_BACKEND=lambda`.
+  Its role may call `lambda:InvokeFunction` on `slay-executor`, and
+  `states:StartExecution` and `states:DescribeExecution` on the `slay-*`
+  state machines and their executions. The policy names these ARNs from
+  the fixed names, not from the resources, because the function, its role
+  and the state machines would otherwise depend on each other
 - S3 bucket for data storage
 - Automatic lifecycle policies (tier cold data)
 - CORS enabled for future web access
+
+#### 10. Retry State Machine (`infrastructure/stacks/retry_loop.py`)
+
+`slay-retry` is a Standard state machine with a fixed name. One helper,
+`retry_loop(scope, executor)`, builds its states, so another state machine
+can reuse the loop (for example as a Map item processor).
+
+**Input** (written by `LambdaBackend`, or by the fan-out's ItemSelector):
+```
+{
+  index: 0,                                     # the item's index in a fan-out
+  call: encode_call(func_ref, args, kwargs),
+  retry: {
+    waits: [seconds before attempt 2, 3, ...],  # whole seconds, rounded up
+    retry_on: ["failure", "timeout", "crash"],  # a subset
+    timeout: seconds per attempt                # 900 when not set
+  },
+  attempt: 0
+}
+```
+
+The default `timeout` of 900 seconds exceeds the Lambda's 14-minute
+timeout, so without a `timeout` the Lambda's own limit ends an attempt.
+
+**States:**
+1. `Attempt`: a `lambda:invoke` Task with `Payload` = `$.call` and
+   `TimeoutSecondsPath` = `$.retry.timeout`. Its Retry rules retry Lambda
+   service errors and `Lambda.TooManyRequestsException`; these do not
+   count as attempts. A Catch on `States.ALL` stores the error in
+   `$.caught`.
+2. `Raised?`: a Choice on `$.result.Payload.status == "error"`. A handler
+   error has class `failure`; any other response ends the loop.
+3. `Error class`: a Choice on `$.caught.Error`. `States.Timeout` and
+   `Sandbox.Timedout` have class `timeout`; any other error has class
+   `crash`.
+4. `Check retry`: a Pass that computes
+   `States.ArrayContains($.retry.retry_on, $.class)` and
+   `States.ArrayLength($.retry.waits)`.
+5. `Retry?`: a Choice. If the class is retryable and `$.attempt` is less
+   than the number of waits, `Next attempt` rebuilds the state as `index`,
+   `call`, `retry`, `attempt + 1` (`States.MathAdd`) and `wait`
+   (`States.ArrayGetItem($.retry.waits, $.attempt)`). A `Wait` on
+   `SecondsPath` = `$.wait` leads back to `Attempt`.
+6. Otherwise the loop ends.
+
+**Output:** the execution always succeeds, so a Map item processor can
+report every item. The output is `{index: $.index, response: ...}`. The
+response is the handler's response for a result or a `failure`. For a
+`timeout` or a `crash` it is:
+```
+{status: "lambda_error", errorType: $.caught.Error, errorMessage: $.caught.Cause}
+```
+The loop ends in a Succeed state for this case too: a Fail state cannot
+re-emit an error name such as `States.Timeout`.
+
+`LambdaBackend` decodes the response as it decodes a direct invoke. For
+`lambda_error`, a cause that holds a Lambda error payload (JSON with
+`errorType`, `errorMessage` and `stackTrace`) is reported as a
+`FunctionError` is. Any other cause becomes the `message`, and the error
+name becomes the `error_type`. An execution that ends in another status
+(`FAILED`, `TIMED_OUT`, `ABORTED`) raises `RemoteExecutionError` with the
+execution's `error` and `cause`.
+
+**Testing:** moto runs the synthesized definition with LocalStack's ASL
+interpreter (`moto[stepfunctions]`). The tests replace the interpreter's
+Lambda client with the in-process handler, so the loop, the handler and
+`LambdaBackend` run together without AWS.
+
+#### 11. Fan-out State Machine (`infrastructure/stacks/fanout.py`)
+
+`slay-fanout` is a Standard state machine with a fixed name. It holds one
+Distributed Map whose item processor is the retry loop of section 10.
+
+**Input** (written by `LambdaBackend.start_many`):
+```
+{
+  items_key: "fanout/<execution name>/items.json",
+  func_ref: ref_to_dict(func_ref),
+  retry: {waits, retry_on, timeout},   # as in section 10; no waits without add_retry
+  max_concurrency: max_concurrent or 0,# 0: no limit of slay's own
+  item_count: len(args_list)           # the Map ignores it; job_results reads it
+}
+```
+
+The client writes the items file first: a JSON array with one
+`{args_refs, kwargs_refs}` object per call, as `encode_call` writes them.
+
+**The Map:**
+- `ItemReader` reads the items file from the storage bucket (`Key.$` =
+  `$.items_key`).
+- `ItemSelector` builds each child's input: `index` from
+  `$$.Map.Item.Index`, `call` from `$.func_ref` and the item's
+  `args_refs` and `kwargs_refs`, `retry` from `$.retry`, and `attempt` 0.
+- `MaxConcurrencyPath` = `$.max_concurrency`.
+- The children are Standard executions (`ProcessorConfig`: `DISTRIBUTED`,
+  `STANDARD`). An Express child stops after 5 minutes; the Lambda runs
+  for up to 14.
+- No `ToleratedFailurePercentage`: its default of 0 fails the Map when a
+  child fails. A child fails only for a Step Functions reason, because
+  the loop reports a function's error as output.
+- `ResultWriter` writes the child outputs to `fanout/results/` in the
+  bucket. The execution's output names the manifest
+  (`ResultWriterDetails.Key`), whose `ResultFiles.SUCCEEDED` lists the
+  result files. Each file is a JSON array of entries whose `Output` is a
+  child's output as JSON text. A Map without `ResultWriter` returns all
+  child outputs in one state, which holds at most 256 KB.
+
+`job_results` reads the manifest and the result files, places each
+`response` at its `index`, and decodes the responses as in section 10. If
+any item failed, it raises the error of the lowest failing index. An
+index below the input's `item_count` with no response raises
+`RemoteExecutionError`. The job ID is only the execution ARN, so the
+count comes from the execution's input (`DescribeExecution`).
+
+`ResultWriterV2` renders a `ResultWriter` only when the CDK feature flag
+`@aws-cdk/aws-stepfunctions:useDistributedMapResultWriterV2` is on.
+`ComputeStack` sets the flag in its own context, so the stack needs no
+entry in `cdk.json`.
+
+The items file, the bucket name in `ItemReader` and `ResultWriter`, and
+the executor's `SLAY_STORAGE_BUCKET` are the same bucket, so the client's
+`SLAY_STORAGE_BUCKET` must name it. `start_many` raises `StorageError`
+when it names a directory.
+
+**Testing:** moto's `ResultWriter` writes the manifest but no result
+files. The test fixture writes them as AWS does, from the child outputs.
+
+**Jobs:** `start_apply(fn, items, max_concurrent=None)` in `api.py`
+returns a `Job(id, backend)`; `attach(job_id)` builds one for the current
+backend. If `fn` is a `Retried` wrapper, `start_apply` passes its inner
+function and the policy to `start_many`; any other wrapper goes to the
+executors as the function. `apply()` keeps the client-side wrapper path
+of section 7.
 
 ## Data Flow
 
@@ -319,9 +599,14 @@ for item in items:
   item as is if it is a Reference, else create_reference(item) → item_ref
   args_list.append(([item_ref], {}))
   ↓
-ThreadPoolExecutor(max_workers=min(len(items), 500))
-  ├─ Submit execute() for each (args_refs, kwargs_refs)
-  ├─ as_completed() collects results
+lambda_backend.execute_many(func_ref, args_list, retry, max_concurrent)
+  ├─ write fanout/<name>/items.json to the bucket
+  ├─ start slay-fanout with func_ref, retry and max_concurrency
+  │    └─ Distributed Map: one child per item, each the retry loop
+  │         └─ ResultWriter → fanout/results/<map run>/
+  ├─ poll DescribeExecution until it ends
+  ├─ read the manifest and the result files; order by index
+  ├─ Any error: raise the error of the lowest failing index
   └─ Return list in input order
   ↓
 Return [result_ref1, result_ref2, ...]     # slay.get_many() fetches them
@@ -387,14 +672,54 @@ result = other.get()   # Fetch when needed
 - Flexibility: Easy to swap based on needs
 - Extensibility: Users can implement custom backends
 
-### 6. Threading for Parallel Invocation
+### 6. Step Functions for Fan-out
 
-**Why ThreadPoolExecutor for Lambda?**
-- Lambda invocation is I/O bound (network)
-- GIL doesn't block I/O
-- Simple and reliable
-- Scales to hundreds of concurrent tasks
-- Future: Switch to async if needed
+**Where the I/O happens.** The user pays only for I/O on the client's own
+link, from a laptop or a phone to AWS. That link is slow and can drop.
+Inside AWS, the handler fetches every argument from S3 before the function
+starts, so the function's own code does no I/O for its arguments. A
+fan-out must therefore use the client's link a fixed number of times,
+whatever the number of items.
+
+- With `slay-fanout`, the client sends each value it stores with `put`
+  once, because storage is content-addressed. It then sends one items file
+  of References, one `StartExecution` and the status polls.
+- The client receives the manifest and the result files, which also hold
+  References. A value crosses the link again only when the client calls
+  `.get()`.
+- Every per-item invoke, argument fetch and result write runs between Step
+  Functions, Lambda and S3, in the region. The I/O spreads over the
+  executors.
+- With client threads, each item costs one Invoke request and one response
+  on the client's link. The client must stay connected until the last item
+  ends.
+
+**Why a Distributed Map instead of client threads?**
+- The client's link carries a fixed number of calls, not one per item (see
+  above)
+- The client may exit while the work goes on (see Jobs in section 11)
+- Step Functions limits concurrency (`max_concurrent`) and retries each
+  item with the same loop as `add_retry`
+- A nested `apply()` in an executor needs no threads in that executor
+
+**Why Standard children, not Express?** Old slay ran each `apply` as one
+synchronous Express execution (`StartSyncExecution`). One request returned
+the results, and Express bills by execution and duration, not by state
+transition. Express gives up durability:
+- an Express execution stops after 5 minutes, and the executor runs for up
+  to 14;
+- a synchronous Express execution runs at most once and keeps no state, so
+  no job outlives the client;
+- a Distributed Map cannot run inside an Express workflow, so the parent
+  must be Standard in any case.
+
+A Standard child costs about four state transitions per item: the Map
+iteration, `Attempt`, `Raised?` and `Returned`. At the us-east-1 price of
+$0.000025 a transition, that is $0.0001 per item. An Express child of a
+5-second call at 64 MB costs about a third of that. However, an Express
+child that needs more than 5 minutes, retry waits included, fails. Express
+children may come later, for short calls, if their durability risks prove
+acceptable.
 
 ## Limitations & Trade-Offs
 
@@ -410,10 +735,6 @@ result = other.get()   # Fetch when needed
 3. **Concurrency**: Limited to Lambda concurrency (default ~1000)
    - Can request increase from AWS
    - Or use multiple AWS accounts
-
-4. **max_concurrent not implemented**
-   - MVP limitation
-   - Future: Step Functions integration
 
 ### Design Trade-Offs
 

@@ -10,9 +10,12 @@ Backends handle running functions in different environments:
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from slay.core.reference import Reference
+
+if TYPE_CHECKING:
+    from slay.wrappers import Retried
 
 
 class ExecutorBackend(ABC):
@@ -29,7 +32,11 @@ class ExecutorBackend(ABC):
 
     @abstractmethod
     def execute(
-        self, func_ref: Reference, args: list[Reference], kwargs: dict[str, Reference]
+        self,
+        func_ref: Reference,
+        args: list[Reference],
+        kwargs: dict[str, Reference],
+        retry: Optional["Retried"] = None,
     ) -> Reference:
         """
         Execute function with given arguments.
@@ -41,12 +48,17 @@ class ExecutorBackend(ABC):
             func_ref: Reference to function to execute
             args: List of argument references
             kwargs: Keyword argument names mapped to references
+            retry: A slay.wrappers.Retried policy, or None for one attempt
 
         Returns:
             Reference to result
 
         Raises:
-            RemoteExecutionError: If execution fails
+            Exception: The exception the function raised, of its own type.
+                A remote backend sets its __cause__ to a RemoteExecutionError
+                with the remote traceback and the captured output.
+            RemoteExecutionError: If the backend fails outside the function,
+                or if the function's exception cannot be carried back
         """
         pass
 
@@ -55,6 +67,8 @@ class ExecutorBackend(ABC):
         self,
         func_ref: Reference,
         args_list: list[tuple[list[Reference], dict[str, Reference]]],
+        retry: Optional["Retried"] = None,
+        max_concurrent: Optional[int] = None,
     ) -> list[Reference]:
         """
         Execute function on multiple argument sets in parallel.
@@ -63,12 +77,45 @@ class ExecutorBackend(ABC):
             func_ref: Reference to function
             args_list: List of (args_refs, kwargs_refs) tuples, shaped as
                 the args and kwargs of execute()
+            retry: A Retried policy for every call, or None
+            max_concurrent: The most calls at once, or None for the
+                backend's own limit
 
         Returns:
             List of result references in same order as inputs
 
         Raises:
-            RemoteExecutionError: If any execution fails
+            Exception: The error of the lowest failing index, as execute()
+                raises it
+        """
+        pass
+
+    @abstractmethod
+    def start_many(
+        self,
+        func_ref: Reference,
+        args_list: list[tuple[list[Reference], dict[str, Reference]]],
+        retry: Optional["Retried"] = None,
+        max_concurrent: Optional[int] = None,
+    ) -> str:
+        """
+        Start execute_many as a job and return its ID; job_results gives
+        the outcome, so a client can leave and come back.
+        """
+        pass
+
+    @abstractmethod
+    def job_status(self, job_id: str) -> str:
+        """
+        The job's status: "RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT" or
+        "ABORTED". A job whose calls raised has finished: "SUCCEEDED".
+        """
+        pass
+
+    @abstractmethod
+    def job_results(self, job_id: str) -> list[Reference]:
+        """
+        Wait for the job, then return its results or raise as execute_many
         """
         pass
 

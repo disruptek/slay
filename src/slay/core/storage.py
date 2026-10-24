@@ -8,6 +8,7 @@ Automatically selects optimal storage tier based on data size:
 """
 
 import os
+from contextlib import contextmanager
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -181,84 +182,209 @@ def load_many(refs: list[Reference], max_workers: int = 10) -> list:
 
 
 # ============================================================================
-# S3 Operations
+# Object Store (S3 or a directory)
 # ============================================================================
+
+
+def write_object(key: str, data: bytes, metadata: Optional[dict[str, str]] = None) -> None:
+    """
+    Write bytes under a key in SLAY_STORAGE_BUCKET (S3 or a directory).
+
+    Args:
+        key: Object key, for example "cache/ab/abc....json"
+        data: Bytes to write
+        metadata: S3 object metadata; a directory ignores it
+
+    Raises:
+        StorageError: If SLAY_STORAGE_BUCKET is not set, or the write fails
+    """
+    open_store().put(key, data, metadata)
+
+
+def read_object(key: str) -> Optional[bytes]:
+    """
+    Read the bytes under a key in SLAY_STORAGE_BUCKET.
+
+    Returns:
+        The bytes, or None if the key does not exist
+
+    Raises:
+        StorageError: If SLAY_STORAGE_BUCKET is not set, or the read fails
+            for another reason (S3 reports a missing key as access denied
+            to a caller without s3:ListBucket)
+    """
+    return open_store().get(key)
+
+
+def object_exists(key: str) -> bool:
+    """
+    Check whether a key exists in SLAY_STORAGE_BUCKET, without reading it.
+
+    Raises:
+        StorageError: As read_object
+    """
+    return open_store().exists(key)
 
 
 def _store_s3(data: bytes, hash_val: str) -> str:
     """
-    Store data in S3 (or local filesystem if bucket env var is a path).
+    Store a value's bytes under refs/, sharded by the first 2 chars of hash.
 
     Args:
         data: Bytes to store
         hash_val: Content hash (for key)
 
     Returns:
-        S3 object key or filesystem path
+        The object key
 
     Raises:
         StorageError: If storage operation fails
     """
-    bucket = _get_storage_bucket()
-    try:
-        # Shard by first 2 chars for better S3 performance
-        key = f"refs/{hash_val[:2]}/{hash_val}.bin"
-
-        # Check if bucket is actually a local path (for testing)
-        if os.path.exists(bucket) and os.path.isdir(bucket):
-            # Use local filesystem
-            filepath = os.path.join(bucket, key)
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            with open(filepath, "wb") as f:
-                f.write(data)
-            return key
-
-        # Use S3
-        import boto3
-
-        s3 = boto3.client("s3")
-        s3.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=data,
-            ContentType="application/octet-stream",
-            Metadata={"hash": hash_val, "size": str(len(data))},
-        )
-        return key
-    except Exception as e:
-        raise StorageError(f"Failed to store in S3: {e}") from e
+    key = f"refs/{hash_val[:2]}/{hash_val}.bin"
+    write_object(key, data, {"hash": hash_val, "size": str(len(data))})
+    return key
 
 
 def _fetch_s3(key: str) -> bytes:
     """
-    Fetch data from S3 (or local filesystem if bucket env var is a path).
-
-    Args:
-        key: S3 object key or filesystem path
-
-    Returns:
-        Object bytes
+    Fetch a value's bytes by the key _store_s3 returned.
 
     Raises:
-        StorageError: If fetch fails
+        StorageError: If the key does not exist, or the fetch fails
     """
-    bucket = _get_storage_bucket()
-    try:
-        # Check if bucket is actually a local path (for testing)
-        if os.path.exists(bucket) and os.path.isdir(bucket):
-            # Use local filesystem
-            filepath = os.path.join(bucket, key)
-            with open(filepath, "rb") as f:
-                return f.read()
+    data = read_object(key)
+    if data is None:
+        raise StorageError(f"Failed to fetch {key}: it does not exist")
+    return data
 
-        # Use S3
+
+@contextmanager
+def _storage_errors(action: str, key: str):
+    """Re-raise any failure but StorageError as StorageError"""
+    try:
+        yield
+    except StorageError:
+        raise
+    except Exception as e:
+        raise StorageError(f"Failed to {action} {key}: {e}") from e
+
+
+class _Store:
+    """
+    Objects by key in one location. put, get and exists raise StorageError;
+    a subclass implements _put, _get (None if missing) and _exists.
+    """
+
+    def put(self, key: str, data: bytes, metadata: Optional[dict[str, str]] = None) -> None:
+        with _storage_errors("write", key):
+            self._put(key, data, metadata or {})
+
+    def get(self, key: str) -> Optional[bytes]:
+        with _storage_errors("read", key):
+            return self._get(key)
+
+    def exists(self, key: str) -> bool:
+        with _storage_errors("check", key):
+            return self._exists(key)
+
+
+class _DirectoryStore(_Store):
+    """Objects as files under a local directory, for tests and local use"""
+
+    def __init__(self, root: str):
+        self.root = root
+
+    def _path(self, key: str) -> str:
+        return os.path.join(self.root, key)
+
+    def _put(self, key: str, data: bytes, metadata: dict[str, str]) -> None:
+        path = self._path(key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+
+    def _get(self, key: str) -> Optional[bytes]:
+        try:
+            with open(self._path(key), "rb") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    def _exists(self, key: str) -> bool:
+        return os.path.isfile(self._path(key))
+
+
+class _S3Store(_Store):
+    """Objects in an S3 bucket; one client, which threads may share"""
+
+    _MISSING = ("404", "NoSuchKey", "NotFound")
+
+    def __init__(self, bucket: str):
         import boto3
 
-        s3 = boto3.client("s3")
-        response = s3.get_object(Bucket=bucket, Key=key)
+        self.bucket = bucket
+        self.s3 = boto3.client("s3")
+
+    def _put(self, key: str, data: bytes, metadata: dict[str, str]) -> None:
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=data,
+            ContentType="application/octet-stream",
+            Metadata=metadata,
+        )
+
+    def _get(self, key: str) -> Optional[bytes]:
+        try:
+            response = self.s3.get_object(Bucket=self.bucket, Key=key)
+        except self.s3.exceptions.ClientError as e:
+            if e.response.get("Error", {}).get("Code") in self._MISSING:
+                return None
+            raise
         return response["Body"].read()
-    except Exception as e:
-        raise StorageError(f"Failed to fetch from S3: {e}") from e
+
+    def _exists(self, key: str) -> bool:
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=key)
+        except self.s3.exceptions.ClientError as e:
+            if e.response.get("Error", {}).get("Code") in self._MISSING:
+                return False
+            raise
+        return True
+
+
+def open_store() -> _Store:
+    """
+    The store SLAY_STORAGE_BUCKET names: a directory if one exists there,
+    else an S3 bucket. Open one store for a batch of threaded calls:
+    creating boto3 clients from several threads at once is not safe.
+
+    Raises:
+        StorageError: If SLAY_STORAGE_BUCKET is not set
+    """
+    location = _get_storage_bucket()
+    if os.path.isdir(location):
+        return _DirectoryStore(location)
+    return _S3Store(location)
+
+
+def open_bucket() -> _S3Store:
+    """
+    The S3 bucket SLAY_STORAGE_BUCKET names, for objects that an AWS
+    service reads or writes itself (a Step Functions ItemReader, for one).
+
+    Raises:
+        StorageError: If SLAY_STORAGE_BUCKET is not set, or names a
+            directory
+    """
+    location = _get_storage_bucket()
+    if os.path.isdir(location):
+        raise StorageError(
+            f"SLAY_STORAGE_BUCKET names the directory {location}, but AWS reads "
+            "and writes these objects itself: set it to the S3 bucket name (the "
+            "StorageBucket output of SlayStorageStack)."
+        )
+    return _S3Store(location)
 
 
 def _get_storage_bucket() -> str:

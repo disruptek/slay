@@ -296,24 +296,28 @@ class RecordingBackend:
         from slay.backends.local import LocalBackend
 
         self.calls = []
+        self.many = []
         self._local = LocalBackend()
 
-    def execute(self, func_ref, args, kwargs):
+    def execute(self, func_ref, args, kwargs, retry=None):
         self.calls.append((args, kwargs))
-        return self._local.execute(func_ref, args, kwargs)
+        return self._local.execute(func_ref, args, kwargs, retry)
 
-    def execute_many(self, func_ref, args_list):
-        return [self.execute(func_ref, args, kwargs) for args, kwargs in args_list]
+    def execute_many(self, func_ref, args_list, retry=None, max_concurrent=None):
+        self.many.append({"func_ref": func_ref, "retry": retry, "max_concurrent": max_concurrent})
+        return [self.execute(func_ref, args, kwargs, retry) for args, kwargs in args_list]
+
+
+@pytest.fixture
+def recorder(monkeypatch):
+    """A RecordingBackend that run() and apply() use"""
+    backend = RecordingBackend()
+    monkeypatch.setattr(slay.api, "get_backend", lambda: backend)
+    return backend
 
 
 class TestReferenceArguments:
     """A top-level Reference argument passes through and is resolved remotely"""
-
-    @pytest.fixture
-    def recorder(self, monkeypatch):
-        backend = RecordingBackend()
-        monkeypatch.setattr(slay.api, "get_backend", lambda: backend)
-        return backend
 
     def test_function_receives_value_of_reference(self, recorder):
         """The function gets the value behind a Reference argument"""
@@ -366,6 +370,50 @@ class TestReferenceArguments:
         fn = slay.put(lambda xs: type(xs[0]).__name__)
 
         assert fn([slay.put(5)]).get() == "Reference"
+
+
+class TestMaxConcurrent:
+    """apply() hands max_concurrent to the backend, through any wrapper"""
+
+    def test_plain_function(self, recorder):
+        fn = slay.put(lambda x: x)
+
+        assert slay.get_many(slay.apply(fn, [1, 2], max_concurrent=5)) == [1, 2]
+        (many,) = recorder.many
+        assert many["max_concurrent"] == 5
+        assert many["func_ref"] == fn
+
+    def test_no_limit_by_default(self, recorder):
+        slay.apply(slay.put(lambda x: x), [1])
+
+        assert recorder.many[0]["max_concurrent"] is None
+
+    def test_retried_function(self, recorder):
+        """The retry policy and the limit reach execute_many together"""
+        fn = slay.put(lambda x: x)
+
+        slay.apply(slay.add_retry(fn), [1], max_concurrent=5)
+
+        (many,) = recorder.many
+        assert many["func_ref"] == fn
+        assert isinstance(many["retry"], slay.wrappers.Retried)
+        assert many["max_concurrent"] == 5
+
+    def test_cached_function(self, recorder, mock_s3_bucket):
+        """The misses fan out with the limit"""
+        fn = slay.put(lambda x: x)
+
+        slay.apply(slay.add_caching(fn), [1, 2], max_concurrent=5)
+
+        (many,) = recorder.many
+        assert many["func_ref"] == fn
+        assert many["max_concurrent"] == 5
+
+    def test_local_backend_accepts_it(self, local_backend):
+        """The local backend runs the items one at a time"""
+        fn = slay.put(lambda x: x * 2)
+
+        assert slay.get_many(slay.apply(fn, [1, 2], max_concurrent=1)) == [2, 4]
 
 
 class TestApply:
@@ -425,6 +473,52 @@ class TestApply:
         results = slay.get_many(result_refs)
         
         assert results == ["ALICE", "BOB", "CHARLIE"]
+
+
+class TestLocalErrors:
+    """On the local backend, a function's exception propagates unchanged"""
+
+    def test_run_raises_original_exception(self, local_backend):
+        """run() raises the function's own exception with its own traceback"""
+
+        def boom(x):
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError) as excinfo:
+            slay.put(boom)(1)
+
+        assert type(excinfo.value) is ValueError
+        assert str(excinfo.value) == "boom"
+        assert excinfo.value.__cause__ is None
+        assert excinfo.traceback[-1].name == "boom"
+
+    def test_apply_raises_lowest_failing_index(self, local_backend):
+        """apply() raises the error of the first failing item, unchanged"""
+
+        def fail_odd(x):
+            if x % 2:
+                raise ValueError(str(x))
+            return x
+
+        with pytest.raises(ValueError) as excinfo:
+            slay.apply(slay.put(fail_odd), [0, 1, 2, 3])
+
+        assert type(excinfo.value) is ValueError
+        assert str(excinfo.value) == "1"
+
+    def test_apply_stops_at_first_failure(self, local_backend, tmp_path):
+        """Items after the first failure do not run"""
+
+        def mark_then_fail(x):
+            (tmp_path / f"ran-{x}").touch()
+            if x == 1:
+                raise ValueError("stop")
+            return x
+
+        with pytest.raises(ValueError):
+            slay.apply(slay.put(mark_then_fail), [0, 1, 2, 3])
+
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["ran-0", "ran-1"]
 
 
 class TestGetMany:

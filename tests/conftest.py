@@ -3,8 +3,6 @@ Pytest configuration and shared fixtures for slay tests.
 """
 
 import pytest
-import os
-from unittest.mock import patch
 
 
 @pytest.fixture
@@ -18,19 +16,25 @@ def local_backend():
 
 
 @pytest.fixture
-def clear_cache():
-    """Clear slay cache before and after test"""
-    import slay
-
-    slay.wrappers.clear_cache()
-    yield
-    slay.wrappers.clear_cache()
+def mock_s3_bucket(tmp_path, monkeypatch):
+    """Mock S3 storage using local filesystem"""
+    monkeypatch.setenv("SLAY_STORAGE_BUCKET", str(tmp_path))
+    return tmp_path
 
 
 @pytest.fixture
-def mock_s3_bucket(tmp_path):
-    """Mock S3 storage using local filesystem"""
-    os.environ["SLAY_STORAGE_BUCKET"] = str(tmp_path)
-    yield tmp_path
-    if "SLAY_STORAGE_BUCKET" in os.environ:
-        del os.environ["SLAY_STORAGE_BUCKET"]
+def s3_bucket(monkeypatch):
+    """An S3 bucket in moto, named by SLAY_STORAGE_BUCKET; no AWS calls"""
+    moto = pytest.importorskip("moto")
+    import boto3
+
+    for name in ("AWS_PROFILE", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+
+    with moto.mock_aws():
+        boto3.client("s3").create_bucket(Bucket="slay-test-bucket")
+        monkeypatch.setenv("SLAY_STORAGE_BUCKET", "slay-test-bucket")
+        yield "slay-test-bucket"

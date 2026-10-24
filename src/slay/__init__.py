@@ -8,6 +8,7 @@ Core operations:
     - get(ref): Retrieve data from reference
     - run(fn, *args): Execute function (core operation)
     - apply(fn, items): Parallel execution over items
+    - start_apply(fn, items) / attach(job_id): The same as a Job
     - Callable syntax: fn(arg) is sugar for run(fn, arg)
 
 Usage:
@@ -38,9 +39,10 @@ Usage:
 
 from slay.core.reference import create_reference, Reference
 from slay.core.context import set_backend, get_backend
-from slay.api import put, get, get_many, run, apply
-from slay.wrappers import add_retry, add_caching
-from slay.exceptions import RemoteExecutionError, SlayError
+from slay.api import put, get, get_many, run, apply, start_apply, attach
+from slay.jobs import Job
+from slay.wrappers import add_retry, add_caching, add_cache_only
+from slay.exceptions import CacheMiss, RemoteExecutionError, SlayError
 
 __version__ = "0.1.0"
 
@@ -51,16 +53,21 @@ __all__ = [
     "get_many",
     "run",
     "apply",
+    "start_apply",
+    "attach",
+    "Job",
     # References
     "create_reference",
     "Reference",
     # Wrappers
     "add_retry",
     "add_caching",
+    "add_cache_only",
     # Configuration
     "set_backend",
     "get_backend",
     # Exceptions
+    "CacheMiss",
     "RemoteExecutionError",
     "SlayError",
 ]
